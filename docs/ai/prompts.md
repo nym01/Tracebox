@@ -81,3 +81,20 @@ the process manually after timeout.
 **What we used / didn't use:** went with exit code and
 context.WithTimeout, the goroutine idea wasnt needed since
 context already cleans up the process on its own
+
+
+
+
+## 2026-05-29 · top level status rule
+
+**Prompt:** how to make sure the top level status reflects
+the first failing test in go
+
+**Response summary:** explained iterating tests in order and
+updating top level only when its still accepted
+
+**What we used / didn't use:** logic was already correct from
+earlier steps, just added a test to lock it down
+
+
+

@@ -80,3 +80,36 @@ func TestTimeExceeded(t *testing.T) {
 		t.Errorf("tests[0].status: want time_exceeded, got %q", resp.Tests[0].Status)
 	}
 }
+
+// TestTopLevelFirstNonAccepted verifies that when test 1 passes and test 2
+// fails, the top-level status is the second test's status (first non-accepted).
+func TestTopLevelFirstNonAccepted(t *testing.T) {
+	orig := defaultRunner
+	// Runner always produces "hello\n"; test 1 expects it (accepted),
+	// test 2 expects something different (wrong_output).
+	defaultRunner = &fakeRunner{result: runner.RunResult{Stdout: "hello\n", ExitCode: 0}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"print('hello')","tests":[{"stdin":"","expected_stdout":"hello\n"},{"stdin":"","expected_stdout":"world\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tests) != 2 {
+		t.Fatalf("want 2 test results, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "accepted" {
+		t.Errorf("tests[0].status: want accepted, got %q", resp.Tests[0].Status)
+	}
+	if resp.Tests[1].Status != "wrong_output" {
+		t.Errorf("tests[1].status: want wrong_output, got %q", resp.Tests[1].Status)
+	}
+	if resp.Status != "wrong_output" {
+		t.Errorf("top-level status: want wrong_output, got %q", resp.Status)
+	}
+}
