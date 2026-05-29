@@ -26,4 +26,14 @@ dockerfile pattern. didn't use the suggested middleware setup,
 kept it minimal for stage 1.
 
 
+## 2026-05-29 · /run validation
 
+**Prompt:** how do i validate incoming json fields in go
+and send back proper error responses
+
+**Response summary:** showed how to parse json into structs
+and check fields manually
+
+**What we used / didn't use:** used the struct approach, skipped
+the regex suggestion for filename check, strings.Contains
+was enough and simpler
