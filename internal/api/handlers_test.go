@@ -81,6 +81,38 @@ func TestTimeExceeded(t *testing.T) {
 	}
 }
 
+func TestBuildFailed(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &fakeRunner{result: runner.RunResult{ExitCode: 1, Stderr: "error: expected ';'"}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"int main(){","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":"hi\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "build_failed" {
+		t.Errorf("top-level status: want build_failed, got %q", resp.Status)
+	}
+	if resp.Build == nil {
+		t.Fatal("expected build field in response, got nil")
+	}
+	if resp.Build.Status != "failed" {
+		t.Errorf("build.status: want failed, got %q", resp.Build.Status)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "not_executed" {
+		t.Errorf("tests[0].status: want not_executed, got %q", resp.Tests[0].Status)
+	}
+}
+
 // TestTopLevelFirstNonAccepted verifies that when test 1 passes and test 2
 // fails, the top-level status is the second test's status (first non-accepted).
 func TestTopLevelFirstNonAccepted(t *testing.T) {

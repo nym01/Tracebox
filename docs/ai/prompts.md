@@ -98,3 +98,16 @@ earlier steps, just added a test to lock it down
 
 
 
+## 2026-05-29 · c++ compilation
+
+**Prompt:** how do i add a compile step in go before running
+the binary, and what happens if compilation fails
+
+**Response summary:** run g++ as a subprocess first, check
+exit code, if it fails skip all tests and return build_failed
+
+**What we used / didn't use:** used this exactly, also ran
+into a docker port conflict while testing, fixed that
+separately by stopping the old container
+
+

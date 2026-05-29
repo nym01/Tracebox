@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +25,13 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+type BuildResult struct {
+	Status     string `json:"status"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
 type TestResult struct {
 	Status       string `json:"status"`
 	Stdout       string `json:"stdout"`
@@ -34,6 +42,7 @@ type TestResult struct {
 
 type RunResponse struct {
 	Status string       `json:"status"`
+	Build  *BuildResult `json:"build,omitempty"`
 	Tests  []TestResult `json:"tests"`
 }
 
@@ -76,6 +85,59 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rr := defaultRunner
+
+	// Build phase — compiled languages only.
+	var buildResult *BuildResult
+	if lang.Build != nil {
+		buildCmd := resolveTokens(lang.Build.Cmd, srcFilename, artifactFilename)
+		buildArgs := make([]string, len(lang.Build.Args))
+		for j, a := range lang.Build.Args {
+			buildArgs[j] = resolveTokens(a, srcFilename, artifactFilename)
+		}
+		wallSec := lang.Build.Limits.WallTimeSec
+		if wallSec <= 0 {
+			wallSec = 30
+		}
+
+		bres, buildErr := rr.Run(r.Context(), runner.RunSpec{
+			Cmd:         buildCmd,
+			Args:        buildArgs,
+			WorkDir:     tmpDir,
+			WallTimeSec: wallSec,
+		})
+		if buildErr != nil {
+			log.Printf("TEMP build error: cmd=%q args=%v workDir=%q err=%v", buildCmd, buildArgs, tmpDir, buildErr)
+			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
+			return
+		}
+
+		log.Printf("TEMP build result: exitCode=%d timedOut=%v stdout=%q stderr=%q", bres.ExitCode, bres.TimedOut, bres.Stdout, bres.Stderr)
+		bstatus := "ok"
+		if bres.TimedOut || bres.ExitCode != 0 {
+			bstatus = "failed"
+		}
+		buildResult = &BuildResult{
+			Status:     bstatus,
+			Stdout:     bres.Stdout,
+			Stderr:     bres.Stderr,
+			DurationMs: bres.DurationMs,
+		}
+
+		if bstatus == "failed" {
+			notExecuted := make([]TestResult, len(req.Tests))
+			for i := range notExecuted {
+				notExecuted[i] = TestResult{Status: "not_executed"}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(RunResponse{
+				Status: "build_failed",
+				Build:  buildResult,
+				Tests:  notExecuted,
+			})
+			return
+		}
+	}
+
 	testResults := make([]TestResult, len(req.Tests))
 	topStatus := "accepted"
 
@@ -99,6 +161,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			WallTimeSec: wallSec,
 		})
 		if runErr != nil {
+			log.Printf("TEMP run error: test=%d cmd=%q args=%v workDir=%q err=%v", i, cmd, args, tmpDir, runErr)
 			testResults[i] = TestResult{Status: "internal_error"}
 			if topStatus == "accepted" {
 				topStatus = "internal_error"
@@ -129,7 +192,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(RunResponse{Status: topStatus, Tests: testResults})
+	json.NewEncoder(w).Encode(RunResponse{Status: topStatus, Build: buildResult, Tests: testResults})
 }
 
 func resolveTokens(s, sourceFile, artifactFile string) string {

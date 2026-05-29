@@ -1,8 +1,7 @@
 {
-  "language": "py3",
-  "source": "print('hello')",
-  "tests": [
-    {"stdin": "", "expected_stdout": "hello\n"},
-    {"stdin": "", "expected_stdout": "world\n"}
-  ]
+  "language": "cpp",
+  "source": "int main(){",
+  "source_filename": "solution.cpp",
+  "artifact_filename": "solution",
+  "tests": [{"stdin": "", "expected_stdout": "hi\n"}]
 }
