@@ -54,3 +54,19 @@ and how to read process output
 **What we used / didn't use:** used the subprocess approach,
 skipped a goroutine based output reader suggestion, kept it
 simpler with direct capture
+
+
+
+
+## 2026-05-29 · output comparison
+
+**Prompt:** how to compare program output to expected in go
+
+**Response summary:** explained string comparison and trimming
+whitespace to tell apart wrong output vs whitespace mismatch
+
+**What we used / didn't use:** used the approach as suggested,
+worked cleanly for all three cases
+
+
+

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/nym01/goboxd/internal/compare"
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
 )
@@ -103,11 +104,13 @@ func run(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		status := "accepted"
+		var status string
 		if result.TimedOut {
 			status = "time_exceeded"
 		} else if result.ExitCode != 0 {
 			status = "runtime_error"
+		} else {
+			status = compare.Compare(result.Stdout, tc.ExpectedStdout)
 		}
 
 		if status != "accepted" && topStatus == "accepted" {
