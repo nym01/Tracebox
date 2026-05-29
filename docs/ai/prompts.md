@@ -111,3 +111,13 @@ into a docker port conflict while testing, fixed that
 separately by stopping the old container
 
 
+## 2026-05-29 · c++ error cases
+
+**Prompt:** how to make sure all error statuses work for
+compiled languages the same way as interpreted ones
+
+**Response summary:** same subprocess approach works for
+both, just runs the compiled binary instead of interpreter
+
+**What we used / didn't use:** reused the existing error
+handling, no new logic needed for c++ specifically

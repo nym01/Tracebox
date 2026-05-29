@@ -20,6 +20,21 @@ func (f *fakeRunner) Run(_ context.Context, _ runner.RunSpec) (runner.RunResult,
 	return f.result, f.err
 }
 
+// sequencedRunner returns results in order; the last result repeats for extra calls.
+type sequencedRunner struct {
+	results []runner.RunResult
+	n       int
+}
+
+func (s *sequencedRunner) Run(_ context.Context, _ runner.RunSpec) (runner.RunResult, error) {
+	i := s.n
+	if i >= len(s.results) {
+		i = len(s.results) - 1
+	}
+	s.n++
+	return s.results[i], nil
+}
+
 func postRun(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(body))
@@ -110,6 +125,134 @@ func TestBuildFailed(t *testing.T) {
 	}
 	if resp.Tests[0].Status != "not_executed" {
 		t.Errorf("tests[0].status: want not_executed, got %q", resp.Tests[0].Status)
+	}
+}
+
+func TestCppRuntimeError(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &sequencedRunner{results: []runner.RunResult{
+		{ExitCode: 0},                               // build ok
+		{ExitCode: 1, Stderr: "Segmentation fault"}, // run exits non-zero
+	}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include <cstdlib>\nint main(){return 1;}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":""}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "runtime_error" {
+		t.Errorf("top-level status: want runtime_error, got %q", resp.Status)
+	}
+	if resp.Build == nil || resp.Build.Status != "ok" {
+		t.Errorf("build.status: want ok, got %v", resp.Build)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "runtime_error" {
+		t.Errorf("tests[0].status: want runtime_error, got %q", resp.Tests[0].Status)
+	}
+}
+
+func TestCppTimeExceeded(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &sequencedRunner{results: []runner.RunResult{
+		{ExitCode: 0},                  // build ok
+		{TimedOut: true, ExitCode: -1}, // run times out
+	}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"int main(){while(true){}}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":""}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "time_exceeded" {
+		t.Errorf("top-level status: want time_exceeded, got %q", resp.Status)
+	}
+	if resp.Build == nil || resp.Build.Status != "ok" {
+		t.Errorf("build.status: want ok, got %v", resp.Build)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "time_exceeded" {
+		t.Errorf("tests[0].status: want time_exceeded, got %q", resp.Tests[0].Status)
+	}
+}
+
+func TestCppWrongOutput(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &sequencedRunner{results: []runner.RunResult{
+		{ExitCode: 0},               // build ok
+		{Stdout: "wrong\n", ExitCode: 0}, // run prints wrong answer
+	}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include<iostream>\nint main(){std::cout<<\"wrong\\n\";}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":"right\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "wrong_output" {
+		t.Errorf("top-level status: want wrong_output, got %q", resp.Status)
+	}
+	if resp.Build == nil || resp.Build.Status != "ok" {
+		t.Errorf("build.status: want ok, got %v", resp.Build)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "wrong_output" {
+		t.Errorf("tests[0].status: want wrong_output, got %q", resp.Tests[0].Status)
+	}
+}
+
+func TestCppOutputWhitespaceMismatch(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &sequencedRunner{results: []runner.RunResult{
+		{ExitCode: 0},                       // build ok
+		{Stdout: "hello   \n", ExitCode: 0}, // trailing spaces
+	}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include<iostream>\nint main(){std::cout<<\"hello   \\n\";}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":"hello\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "output_whitespace_mismatch" {
+		t.Errorf("top-level status: want output_whitespace_mismatch, got %q", resp.Status)
+	}
+	if resp.Build == nil || resp.Build.Status != "ok" {
+		t.Errorf("build.status: want ok, got %v", resp.Build)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "output_whitespace_mismatch" {
+		t.Errorf("tests[0].status: want output_whitespace_mismatch, got %q", resp.Tests[0].Status)
 	}
 }
 

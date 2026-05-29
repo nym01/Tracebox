@@ -1,7 +1,7 @@
 {
   "language": "cpp",
-  "source": "int main(){",
+  "source": "#include<iostream>\nint main(){ std::cout << \"hello \\n\"; }",
   "source_filename": "solution.cpp",
   "artifact_filename": "solution",
-  "tests": [{"stdin": "", "expected_stdout": "hi\n"}]
+  "tests": [{"stdin": "", "expected_stdout": "hello\n"}]
 }
