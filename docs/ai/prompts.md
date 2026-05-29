@@ -37,3 +37,20 @@ and check fields manually
 **What we used / didn't use:** used the struct approach, skipped
 the regex suggestion for filename check, strings.Contains
 was enough and simpler
+
+
+
+
+
+
+## 2026-05-29 · python execution
+
+**Prompt:** how do i run a subprocess in go, pipe stdin
+and capture stdout with a timeout
+
+**Response summary:** showed exec.Cmd with context timeout
+and how to read process output
+
+**What we used / didn't use:** used the subprocess approach,
+skipped a goroutine based output reader suggestion, kept it
+simpler with direct capture
