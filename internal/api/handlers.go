@@ -12,6 +12,8 @@ import (
 	"github.com/nym01/goboxd/internal/runner"
 )
 
+var defaultRunner runner.Runner = runner.SubprocessRunner{}
+
 func RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("POST /run", run)
@@ -73,7 +75,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rr := runner.SubprocessRunner{}
+	rr := defaultRunner
 	testResults := make([]TestResult, len(req.Tests))
 	topStatus := "accepted"
 

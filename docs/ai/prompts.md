@@ -69,4 +69,15 @@ whitespace to tell apart wrong output vs whitespace mismatch
 worked cleanly for all three cases
 
 
+## 2026-05-29 · runtime error and timeout
 
+**Prompt:** how do i know if a process crashed or hit the
+time limit in go
+
+**Response summary:** exit code for crashes, context timeout
+for time limit. also suggested spawning a goroutine to kill
+the process manually after timeout.
+
+**What we used / didn't use:** went with exit code and
+context.WithTimeout, the goroutine idea wasnt needed since
+context already cleans up the process on its own

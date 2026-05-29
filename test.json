@@ -1,5 +1,6 @@
 {
   "language": "py3",
-  "source": "print('hello')",
-  "tests": [{"stdin": "", "expected_stdout": "world\n"}]
+  "source": "while True: pass",
+  "run": {"limits": {"wall_time_sec": 1}},
+  "tests": [{"stdin": "", "expected_stdout": ""}]
 }
