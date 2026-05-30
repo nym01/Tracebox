@@ -395,6 +395,89 @@ func TestCppStdinMultiline(t *testing.T) {
 	}
 }
 
+// TestCppBuildFieldPresent verifies that a compiled language (cpp) always
+// includes the build field with all required subfields in the response.
+func TestCppBuildFieldPresent(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &sequencedRunner{results: []runner.RunResult{
+		{ExitCode: 0, Stdout: "", Stderr: "note: optimization", DurationMs: 412}, // build ok
+		{ExitCode: 0, Stdout: "hi\n"},                                            // run ok
+	}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include<iostream>\nint main(){std::cout<<\"hi\\n\";}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"","expected_stdout":"hi\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	// Decode into raw map to confirm "build" key is present in JSON.
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	buildRaw, ok := raw["build"]
+	if !ok {
+		t.Fatal("build field must be present for compiled language cpp, but it was absent")
+	}
+
+	// Confirm all required subfields exist with correct types.
+	var build BuildResult
+	if err := json.Unmarshal(buildRaw, &build); err != nil {
+		t.Fatalf("unmarshal build: %v", err)
+	}
+	if build.Status == "" {
+		t.Error("build.status must be non-empty")
+	}
+	if build.Status != "ok" {
+		t.Errorf("build.status: want ok, got %q", build.Status)
+	}
+	// stdout and stderr are valid as empty strings; just confirm the fields round-trip.
+	var buildMap map[string]json.RawMessage
+	if err := json.Unmarshal(buildRaw, &buildMap); err != nil {
+		t.Fatalf("unmarshal build map: %v", err)
+	}
+	for _, field := range []string{"status", "stdout", "stderr", "duration_ms"} {
+		if _, present := buildMap[field]; !present {
+			t.Errorf("build.%s field is missing from JSON", field)
+		}
+	}
+}
+
+// TestPy3BuildFieldAbsent verifies that an interpreted language (py3) never
+// includes the build field in the response.
+func TestPy3BuildFieldAbsent(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &fakeRunner{result: runner.RunResult{Stdout: "hi\n", ExitCode: 0}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"print('hi')","tests":[{"stdin":"","expected_stdout":"hi\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	// Decode into raw map to confirm "build" key is absent from JSON.
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := raw["build"]; ok {
+		t.Fatal("build field must be absent for interpreted language py3, but it was present")
+	}
+
+	// Sanity: top-level status is accepted.
+	var statusVal string
+	if err := json.Unmarshal(raw["status"], &statusVal); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if statusVal != "accepted" {
+		t.Errorf("top-level status: want accepted, got %q", statusVal)
+	}
+}
+
 // TestTopLevelFirstNonAccepted verifies that when test 1 passes and test 2
 // fails, the top-level status is the second test's status (first non-accepted).
 func TestTopLevelFirstNonAccepted(t *testing.T) {

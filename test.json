@@ -1,7 +1,5 @@
 {
-  "language": "cpp",
-  "source": "#include<iostream>\n#include<string>\nint main(){std::string s;std::getline(std::cin,s);std::cout<<s<<\"\\n\";}",
-  "source_filename": "solution.cpp",
-  "artifact_filename": "solution",
-  "tests": [{"stdin": "hello", "expected_stdout": "hello\n"}]
+  "language": "py3",
+  "source": "print('hi')",
+  "tests": [{"stdin": "", "expected_stdout": "hi\n"}]
 }

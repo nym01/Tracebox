@@ -138,3 +138,22 @@ cin in c++
 **What we used / didn't use:** stdin was already wired
 correctly, just added tests to confirm it works for both
 languages
+
+
+
+
+
+## 2026-05-29 · build field in response
+
+**Prompt:** how to make a json field appear only for some
+languages and not others in go
+
+**Response summary:** explained using a pointer with omitempty
+so the field is omitted when nil
+
+**What we used / didn't use:** was already implemented
+correctly, just added tests to confirm both cases
+
+
+
+
