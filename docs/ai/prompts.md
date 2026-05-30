@@ -156,4 +156,13 @@ correctly, just added tests to confirm both cases
 
 
 
+## 2026-05-29 · tests cleanup
 
+**Prompt:** how to make sure all go packages have tests
+and everything is clean
+
+**Response summary:** run go test ./... and go vet ./...,
+add missing tests for packages that had none
+
+**What we used / didn't use:** added tests for language
+registry and runner, everything passed clean
