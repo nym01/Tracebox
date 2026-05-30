@@ -121,3 +121,20 @@ both, just runs the compiled binary instead of interpreter
 
 **What we used / didn't use:** reused the existing error
 handling, no new logic needed for c++ specifically
+
+
+
+
+
+## 2026-05-29 · stdin piping
+
+**Prompt:** how to verify stdin is passed correctly to
+subprocesses in go
+
+**Response summary:** explained that strings.NewReader pipes
+stdin into the process, tested with input() in python and
+cin in c++
+
+**What we used / didn't use:** stdin was already wired
+correctly, just added tests to confirm it works for both
+languages

@@ -256,6 +256,145 @@ func TestCppOutputWhitespaceMismatch(t *testing.T) {
 	}
 }
 
+// capturingRunner records every RunSpec it receives and delegates to sequenced results.
+type capturingRunner struct {
+	results []runner.RunResult
+	specs   []runner.RunSpec
+	n       int
+}
+
+func (c *capturingRunner) Run(_ context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	c.specs = append(c.specs, spec)
+	i := c.n
+	if i >= len(c.results) {
+		i = len(c.results) - 1
+	}
+	c.n++
+	return c.results[i], nil
+}
+
+func TestPythonStdinSingleLine(t *testing.T) {
+	orig := defaultRunner
+	cap := &capturingRunner{results: []runner.RunResult{{Stdout: "hello\n", ExitCode: 0}}}
+	defaultRunner = cap
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"line=input();print(line)","tests":[{"stdin":"hello","expected_stdout":"hello\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	if len(cap.specs) != 1 {
+		t.Fatalf("expected 1 Run call, got %d", len(cap.specs))
+	}
+	if cap.specs[0].Stdin != "hello" {
+		t.Errorf("stdin piped to runner: want %q, got %q", "hello", cap.specs[0].Stdin)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("top-level status: want accepted, got %q", resp.Status)
+	}
+}
+
+func TestPythonStdinMultiline(t *testing.T) {
+	const stdinVal = "line1\nline2\nline3\n"
+	orig := defaultRunner
+	cap := &capturingRunner{results: []runner.RunResult{{Stdout: stdinVal, ExitCode: 0}}}
+	defaultRunner = cap
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"import sys\nprint(sys.stdin.read(),end='')","tests":[{"stdin":"line1\nline2\nline3\n","expected_stdout":"line1\nline2\nline3\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	if len(cap.specs) != 1 {
+		t.Fatalf("expected 1 Run call, got %d", len(cap.specs))
+	}
+	if cap.specs[0].Stdin != stdinVal {
+		t.Errorf("stdin piped to runner: want %q, got %q", stdinVal, cap.specs[0].Stdin)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("top-level status: want accepted, got %q", resp.Status)
+	}
+}
+
+func TestCppStdinSingleLine(t *testing.T) {
+	orig := defaultRunner
+	cap := &capturingRunner{results: []runner.RunResult{
+		{ExitCode: 0},                    // build
+		{Stdout: "hello\n", ExitCode: 0}, // run
+	}}
+	defaultRunner = cap
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include<iostream>\n#include<string>\nint main(){std::string s;std::getline(std::cin,s);std::cout<<s<<\"\\n\";}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"hello","expected_stdout":"hello\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	if len(cap.specs) != 2 {
+		t.Fatalf("expected 2 Run calls (build+run), got %d", len(cap.specs))
+	}
+	if cap.specs[0].Stdin != "" {
+		t.Errorf("build stdin: want empty, got %q", cap.specs[0].Stdin)
+	}
+	if cap.specs[1].Stdin != "hello" {
+		t.Errorf("run stdin piped to runner: want %q, got %q", "hello", cap.specs[1].Stdin)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("top-level status: want accepted, got %q", resp.Status)
+	}
+}
+
+func TestCppStdinMultiline(t *testing.T) {
+	const stdinVal = "3\n10\n20\n30\n"
+	orig := defaultRunner
+	cap := &capturingRunner{results: []runner.RunResult{
+		{ExitCode: 0},                // build
+		{Stdout: "60\n", ExitCode: 0}, // run
+	}}
+	defaultRunner = cap
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"cpp","source":"#include<iostream>\nint main(){int n,s=0,x;std::cin>>n;for(int i=0;i<n;i++){std::cin>>x;s+=x;}std::cout<<s<<\"\\n\";}","source_filename":"solution.cpp","artifact_filename":"solution","tests":[{"stdin":"3\n10\n20\n30\n","expected_stdout":"60\n"}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	if len(cap.specs) != 2 {
+		t.Fatalf("expected 2 Run calls (build+run), got %d", len(cap.specs))
+	}
+	if cap.specs[0].Stdin != "" {
+		t.Errorf("build stdin: want empty, got %q", cap.specs[0].Stdin)
+	}
+	if cap.specs[1].Stdin != stdinVal {
+		t.Errorf("run stdin piped to runner: want %q, got %q", stdinVal, cap.specs[1].Stdin)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("top-level status: want accepted, got %q", resp.Status)
+	}
+}
+
 // TestTopLevelFirstNonAccepted verifies that when test 1 passes and test 2
 // fails, the top-level status is the second test's status (first non-accepted).
 func TestTopLevelFirstNonAccepted(t *testing.T) {
