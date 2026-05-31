@@ -2,11 +2,13 @@ package api
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/nym01/goboxd/internal/language"
 )
 
 const maxSourceBytes = 256 * 1024
+const maxFilenameLen = 64
 
 type TestCase struct {
 	Stdin          string `json:"stdin"`
@@ -30,8 +32,8 @@ func validateRunRequest(req *RunRequest) *validationError {
 	if _, ok := language.Lookup(req.Language); !ok {
 		return &validationError{Code: "unknown_language", Message: "language not supported"}
 	}
-	if len(req.Source) == 0 || len(req.Source) > maxSourceBytes {
-		return &validationError{Code: "invalid_source", Message: "source is missing or exceeds 256 KiB"}
+	if len(req.Source) == 0 || !utf8.ValidString(req.Source) || len(req.Source) > maxSourceBytes {
+		return &validationError{Code: "invalid_source", Message: "source is missing, not valid UTF-8, or exceeds 256 KiB"}
 	}
 	if verr := validateFilename(req.SourceFilename); verr != nil {
 		return verr
@@ -48,6 +50,12 @@ func validateRunRequest(req *RunRequest) *validationError {
 func validateFilename(name string) *validationError {
 	if name == "" {
 		return nil
+	}
+	if len(name) > maxFilenameLen {
+		return &validationError{
+			Code:    "invalid_filename",
+			Message: "filename must not exceed 64 characters",
+		}
 	}
 	if strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
 		return &validationError{

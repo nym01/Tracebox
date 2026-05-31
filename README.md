@@ -22,9 +22,8 @@ All other operations go through the Makefile:
 | `make run`       | Build and start the server            |
 | `make test`      | Run unit tests                        |
 | `make integration` | Run integration tests              |
-| `make load`      | Run load/benchmark tests              |
 | `make lint`      | Run the linter                        |
 
 ## Docs
 
-See the `docs/` folder for API reference, supported languages, security model, benchmarks, and architecture notes.
+Architecture decisions and development notes are in `docs/ai/`.

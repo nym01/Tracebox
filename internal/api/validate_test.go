@@ -76,6 +76,21 @@ func TestValidateRunRequest(t *testing.T) {
 			req:      RunRequest{Language: "py3", Source: validSource, Tests: []TestCase{}},
 			wantCode: "invalid_tests",
 		},
+		{
+			name:     "source not valid UTF-8",
+			req:      RunRequest{Language: "py3", Source: "\xff\xfe", Tests: validTests},
+			wantCode: "invalid_source",
+		},
+		{
+			name:     "source_filename too long",
+			req:      RunRequest{Language: "py3", Source: validSource, SourceFilename: strings.Repeat("a", maxFilenameLen+1) + ".py", Tests: validTests},
+			wantCode: "invalid_filename",
+		},
+		{
+			name:     "artifact_filename too long",
+			req:      RunRequest{Language: "cpp", Source: validSource, ArtifactFilename: strings.Repeat("a", maxFilenameLen+1), Tests: validTests},
+			wantCode: "invalid_filename",
+		},
 	}
 
 	for _, tc := range cases {

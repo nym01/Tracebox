@@ -11,6 +11,7 @@ import (
 	"github.com/nym01/goboxd/internal/compare"
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
+	"github.com/nym01/goboxd/internal/status"
 )
 
 var defaultRunner runner.Runner = runner.SubprocessRunner{}
@@ -112,9 +113,9 @@ func run(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("TEMP build result: exitCode=%d timedOut=%v stdout=%q stderr=%q", bres.ExitCode, bres.TimedOut, bres.Stdout, bres.Stderr)
-		bstatus := "ok"
+		bstatus := status.BuildOK
 		if bres.TimedOut || bres.ExitCode != 0 {
-			bstatus = "failed"
+			bstatus = status.BuildFailed
 		}
 		buildResult = &BuildResult{
 			Status:     bstatus,
@@ -123,14 +124,14 @@ func run(w http.ResponseWriter, r *http.Request) {
 			DurationMs: bres.DurationMs,
 		}
 
-		if bstatus == "failed" {
+		if bstatus == status.BuildFailed {
 			notExecuted := make([]TestResult, len(req.Tests))
 			for i := range notExecuted {
-				notExecuted[i] = TestResult{Status: "not_executed"}
+				notExecuted[i] = TestResult{Status: status.NotExecuted}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RunResponse{
-				Status: "build_failed",
+				Status: status.TopLevel(bstatus, nil),
 				Build:  buildResult,
 				Tests:  notExecuted,
 			})
@@ -139,7 +140,6 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	testResults := make([]TestResult, len(req.Tests))
-	topStatus := "accepted"
 
 	for i, tc := range req.Tests {
 		cmd := resolveTokens(lang.Run.Cmd, srcFilename, artifactFilename)
@@ -162,34 +162,33 @@ func run(w http.ResponseWriter, r *http.Request) {
 		})
 		if runErr != nil {
 			log.Printf("TEMP run error: test=%d cmd=%q args=%v workDir=%q err=%v", i, cmd, args, tmpDir, runErr)
-			testResults[i] = TestResult{Status: "internal_error"}
-			if topStatus == "accepted" {
-				topStatus = "internal_error"
-			}
+			testResults[i] = TestResult{Status: status.InternalError}
 			continue
 		}
 
-		var status string
+		var ts string
 		if result.TimedOut {
-			status = "time_exceeded"
+			ts = status.TimeExceeded
 		} else if result.ExitCode != 0 {
-			status = "runtime_error"
+			ts = status.RuntimeError
 		} else {
-			status = compare.Compare(result.Stdout, tc.ExpectedStdout)
-		}
-
-		if status != "accepted" && topStatus == "accepted" {
-			topStatus = status
+			ts = compare.Compare(result.Stdout, tc.ExpectedStdout)
 		}
 
 		testResults[i] = TestResult{
-			Status:       status,
+			Status:       ts,
 			Stdout:       result.Stdout,
 			Stderr:       result.Stderr,
 			DurationMs:   result.DurationMs,
 			MemoryPeakKB: result.MemoryPeakKB,
 		}
 	}
+
+	testStatuses := make([]string, len(testResults))
+	for i, tr := range testResults {
+		testStatuses[i] = tr.Status
+	}
+	topStatus := status.TopLevel(status.BuildOK, testStatuses)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(RunResponse{Status: topStatus, Build: buildResult, Tests: testResults})
