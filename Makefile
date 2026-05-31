@@ -1,19 +1,22 @@
-.PHONY: build run test integration lint
+BINARY := goboxd
+CMD    := ./cmd/goboxd
 
-COMPOSE ?= docker compose
-TOOLS   := $(COMPOSE) --profile tools run --rm tools
+.PHONY: build run test integration bench lint
 
 build:
-	$(COMPOSE) build goboxd
+	go build -o $(BINARY) $(CMD)
 
-run:
-	$(COMPOSE) up goboxd
+run: build
+	./$(BINARY)
 
 test:
-	$(TOOLS) go test ./...
+	go test ./...
 
 integration:
-	$(TOOLS) go test -tags=integration ./tests/...
+	go test -tags integration ./...
+
+bench:
+	go test -bench=. -benchmem ./...
 
 lint:
-	$(TOOLS) golangci-lint run ./...
+	go vet ./...
