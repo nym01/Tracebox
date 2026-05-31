@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -95,7 +94,9 @@ func run(w http.ResponseWriter, r *http.Request) {
 		for j, a := range lang.Build.Args {
 			buildArgs[j] = resolveTokens(a, srcFilename, artifactFilename)
 		}
-		wallSec := lang.Build.Limits.WallTimeSec
+		buildLimits := effectiveLimits(lang.Build.Limits, req.Build)
+		buildArgs = append(buildArgs, requestFlags(req.Build)...)
+		wallSec := buildLimits.WallTimeS
 		if wallSec <= 0 {
 			wallSec = 30
 		}
@@ -107,12 +108,10 @@ func run(w http.ResponseWriter, r *http.Request) {
 			WallTimeSec: wallSec,
 		})
 		if buildErr != nil {
-			log.Printf("TEMP build error: cmd=%q args=%v workDir=%q err=%v", buildCmd, buildArgs, tmpDir, buildErr)
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
 			return
 		}
 
-		log.Printf("TEMP build result: exitCode=%d timedOut=%v stdout=%q stderr=%q", bres.ExitCode, bres.TimedOut, bres.Stdout, bres.Stderr)
 		bstatus := status.BuildOK
 		if bres.TimedOut || bres.ExitCode != 0 {
 			bstatus = status.BuildFailed
@@ -147,8 +146,10 @@ func run(w http.ResponseWriter, r *http.Request) {
 		for j, a := range lang.Run.Args {
 			args[j] = resolveTokens(a, srcFilename, artifactFilename)
 		}
+		args = append(args, requestFlags(req.Run)...)
 
-		wallSec := lang.Run.Limits.WallTimeSec
+		runLimits := effectiveLimits(lang.Run.Limits, req.Run)
+		wallSec := runLimits.WallTimeS
 		if wallSec <= 0 {
 			wallSec = 10
 		}
@@ -161,7 +162,6 @@ func run(w http.ResponseWriter, r *http.Request) {
 			WallTimeSec: wallSec,
 		})
 		if runErr != nil {
-			log.Printf("TEMP run error: test=%d cmd=%q args=%v workDir=%q err=%v", i, cmd, args, tmpDir, runErr)
 			testResults[i] = TestResult{Status: status.InternalError}
 			continue
 		}
@@ -198,4 +198,30 @@ func resolveTokens(s, sourceFile, artifactFile string) string {
 	s = strings.ReplaceAll(s, "{{source}}", sourceFile)
 	s = strings.ReplaceAll(s, "{{artifact}}", artifactFile)
 	return s
+}
+
+// effectiveLimits applies any per-request limits over the language defaults.
+// A request value of zero means "not provided" and keeps the default.
+func effectiveLimits(base language.Limits, override *PhaseConfig) language.Limits {
+	if override == nil || override.Limits == nil {
+		return base
+	}
+	if override.Limits.WallTimeS > 0 {
+		base.WallTimeS = override.Limits.WallTimeS
+	}
+	if override.Limits.MemoryKB > 0 {
+		base.MemoryKB = override.Limits.MemoryKB
+	}
+	if override.Limits.MaxProcesses > 0 {
+		base.MaxProcesses = override.Limits.MaxProcesses
+	}
+	return base
+}
+
+// requestFlags returns the per-request flags for a phase, or nil if none.
+func requestFlags(phase *PhaseConfig) []string {
+	if phase == nil {
+		return nil
+	}
+	return phase.Flags
 }

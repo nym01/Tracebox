@@ -9,9 +9,9 @@ func init() {
 			Cmd:  "python3",
 			Args: []string{"{{source}}"},
 			Limits: Limits{
-				WallTimeSec: 10,
-				MemoryMB:    128,
-				MaxProcs:    32,
+				WallTimeS:    10,
+				MemoryKB:     131072,
+				MaxProcesses: 32,
 			},
 		},
 	})

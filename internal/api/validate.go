@@ -15,12 +15,21 @@ type TestCase struct {
 	ExpectedStdout string `json:"expected_stdout"`
 }
 
+// PhaseConfig carries per-request limits and flags for a build or run phase.
+// Anything omitted falls back to the language default.
+type PhaseConfig struct {
+	Limits *language.Limits `json:"limits,omitempty"`
+	Flags  []string         `json:"flags,omitempty"`
+}
+
 type RunRequest struct {
-	Language         string     `json:"language"`
-	Source           string     `json:"source"`
-	SourceFilename   string     `json:"source_filename"`
-	ArtifactFilename string     `json:"artifact_filename"`
-	Tests            []TestCase `json:"tests"`
+	Language         string       `json:"language"`
+	Source           string       `json:"source"`
+	SourceFilename   string       `json:"source_filename"`
+	ArtifactFilename string       `json:"artifact_filename"`
+	Build            *PhaseConfig `json:"build,omitempty"`
+	Run              *PhaseConfig `json:"run,omitempty"`
+	Tests            []TestCase   `json:"tests"`
 }
 
 type validationError struct {

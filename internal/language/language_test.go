@@ -19,8 +19,8 @@ func TestLookupPy3(t *testing.T) {
 	if lang.SourceFilename == "" {
 		t.Error("py3 SourceFilename must not be empty")
 	}
-	if lang.Run.Limits.WallTimeSec <= 0 {
-		t.Error("py3 Run.Limits.WallTimeSec must be positive")
+	if lang.Run.Limits.WallTimeS <= 0 {
+		t.Error("py3 Run.Limits.WallTimeS must be positive")
 	}
 }
 
@@ -41,8 +41,8 @@ func TestLookupCpp(t *testing.T) {
 	if lang.Run.Cmd == "" {
 		t.Error("cpp Run.Cmd must not be empty")
 	}
-	if lang.Build.Limits.WallTimeSec <= 0 {
-		t.Error("cpp Build.Limits.WallTimeSec must be positive")
+	if lang.Build.Limits.WallTimeS <= 0 {
+		t.Error("cpp Build.Limits.WallTimeS must be positive")
 	}
 }
 

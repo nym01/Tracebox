@@ -1,9 +1,9 @@
 package language
 
 type Limits struct {
-	WallTimeSec int `json:"wall_time_sec,omitempty"`
-	MemoryMB    int `json:"memory_mb,omitempty"`
-	MaxProcs    int `json:"max_procs,omitempty"`
+	WallTimeS    int `json:"wall_time_s,omitempty"`
+	MemoryKB     int `json:"memory_kb,omitempty"`
+	MaxProcesses int `json:"max_processes,omitempty"`
 }
 
 type BuildConfig struct {

@@ -9,18 +9,18 @@ func init() {
 			Cmd:  "g++",
 			Args: []string{"-o", "{{artifact}}", "{{source}}"},
 			Limits: Limits{
-				WallTimeSec: 30,
-				MemoryMB:    512,
-				MaxProcs:    4,
+				WallTimeS:    30,
+				MemoryKB:     524288,
+				MaxProcesses: 4,
 			},
 		},
 		Run: RunConfig{
 			Cmd:  "./{{artifact}}",
 			Args: []string{},
 			Limits: Limits{
-				WallTimeSec: 10,
-				MemoryMB:    256,
-				MaxProcs:    32,
+				WallTimeS:    10,
+				MemoryKB:     262144,
+				MaxProcesses: 32,
 			},
 		},
 	})
