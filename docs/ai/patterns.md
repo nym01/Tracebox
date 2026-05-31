@@ -1,88 +1,97 @@
-## defer cleanup right after creation, not at the end
+## defer cleanup right after creation
 
 **Context:**
-needed temp directories cleaned up on every exit path —
-early returns, errors, panics. putting os.RemoveAll at
-the end of the function misses early returns.
+was getting temp directories leaking during testing.
+took a while to figure out that putting os.RemoveAll
+at the end of the function doesnt work if the function
+returns early on an error.
 
 **Pattern:**
-create the temp dir, then immediately defer os.RemoveAll
-on the next line before doing anything else with it.
+the moment you create a temp dir, the very next line
+should be defer os.RemoveAll. not after the if block,
+not at the end. right after creation. defer runs on
+every return path so you dont have to think about it.
 
 **Where we used it:**
-internal/api/handlers.go — tmpDir is created then
-defer os.RemoveAll fires on every exit path including
-early validation failures and build errors.
+internal/api/handlers.go — learned this after noticing
+temp dirs were not getting cleaned up when validation
+failed early.
 
 
-## context.WithTimeout kills subprocess automatically
+## context.WithTimeout handles process killing for you
 
 **Context:**
-needed to enforce a wall time limit on user code without
-manually managing goroutines or kill signals.
+needed to kill user code after a time limit. thought
+I would need a goroutine that waits and then kills
+the process manually.
 
 **Pattern:**
-wrap the parent context with context.WithTimeout and pass
-it to exec.CommandContext. when the deadline fires the
-process gets killed automatically, no extra code needed.
+turns out exec.CommandContext does this automatically.
+pass it a context with a deadline and it kills the
+process when time runs out. no goroutine needed at all.
+only learned this after asking how timeout detection
+works in go.
 
 **Where we used it:**
-internal/runner/subprocess.go — wall time limit comes
-from RunSpec, gets converted to a timeout duration and
-wrapped around the exec call.
+internal/runner/subprocess.go — wall time limit from
+RunSpec wrapped into context.WithTimeout.
 
 
-## nil pointer as config and control flow in one
+## nil pointer for optional config
 
 **Context:**
-interpreted languages have no build step, compiled ones
-do. needed a way to represent this without a separate
-boolean flag that could get out of sync with the actual
-config.
+python has no build step, c++ does. first thought was
+a boolean HasBuild flag but then the flag and the
+config could get out of sync.
 
 **Pattern:**
-make the optional config a pointer. nil means absent.
-the handler checks nil to skip the build phase, and
-omitempty means the field disappears from JSON responses
-automatically when nil.
+make the config a pointer instead. nil means it doesnt
+exist. handler just checks if Build is nil. bonus: 
+omitempty on a pointer actually works — nil pointer
+disappears from JSON. learned the hard way that
+omitempty on a plain struct doesnt omit it, shows
+up as {} instead.
 
 **Where we used it:**
-internal/language/language.go Language.Build field,
-internal/api/handlers.go build phase check.
+internal/language/language.go and handlers.go —
+also fixed the build field showing up in python
+responses after learning this.
 
 
-## interface for testability and future swap
+## Runner interface so tests dont need real processes
 
 **Context:**
-handler needed to run subprocesses but tests shouldnt
-spawn real processes. also stage 3 needs nsjail which
-is a different execution backend.
+wanted to test status mapping and output comparison
+without actually running python or c++. wasnt sure
+how to do this cleanly.
 
 **Pattern:**
-define a Runner interface, depend on that in the handler.
-tests inject a fake implementation, production uses
-SubprocessRunner. swapping backends later means one
-assignment change.
+put execution behind an interface. tests inject a
+fake that returns whatever result you want. no real
+subprocess needed to test the logic around it.
+also means stage 3 can swap in nsjail without
+touching the handler.
 
 **Where we used it:**
-internal/runner/runner.go Runner interface,
-internal/api/handlers.go handler takes a Runner,
-internal/api/handlers_test.go fakeRunner injects
-controlled results.
+internal/runner/runner.go interface definition,
+internal/api/handlers_test.go fakeRunner used in
+all handler tests.
 
 
-## capped writer to bound subprocess output
+## cap output or memory fills up
 
 **Context:**
-a runaway process could write unlimited stdout and fill
-memory. needed a hard cap without killing the process
-early or breaking the io.Writer interface.
+didnt think about this upfront. realised a program
+that prints forever would fill memory before the
+timeout fires.
 
 **Pattern:**
-wrap a bytes.Buffer in a custom Writer that accepts up
-to N bytes then drops the rest and appends a truncation
-marker. set it as cmd.Stdout and cmd.Stderr instead of a plain buffer.
+custom io.Writer that counts bytes written and stops
+accepting after a limit. append a truncation marker
+so the caller knows output was cut. plug it in as
+cmd.Stdout and cmd.Stderr.
 
 **Where we used it:**
-internal/runner/subprocess.go — cappedWriter with a
-64KB limit on both stdout and stderr for every run.
+internal/runner/subprocess.go — 64KB limit on both
+stdout and stderr. found out about this from the
+spec security section.
