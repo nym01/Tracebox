@@ -208,20 +208,31 @@ func expandArgs(tmpl []string, sourceFile, artifactFile string, flags []string) 
 	return out
 }
 
-// effectiveLimits applies any per-request limits over the language defaults.
-// A request value of zero means "not provided" and keeps the default.
+// effectiveLimits merges per-request limit overrides onto the language defaults.
+// A zero request value means "not provided" and keeps the default.
+// A request value higher than the language default is capped at the default —
+// clients can only tighten limits, never loosen them.
 func effectiveLimits(base language.Limits, override *PhaseConfig) language.Limits {
 	if override == nil || override.Limits == nil {
 		return base
 	}
-	if override.Limits.WallTimeS > 0 {
-		base.WallTimeS = override.Limits.WallTimeS
+	if v := override.Limits.WallTimeS; v > 0 {
+		if base.WallTimeS > 0 && v > base.WallTimeS {
+			v = base.WallTimeS
+		}
+		base.WallTimeS = v
 	}
-	if override.Limits.MemoryKB > 0 {
-		base.MemoryKB = override.Limits.MemoryKB
+	if v := override.Limits.MemoryKB; v > 0 {
+		if base.MemoryKB > 0 && v > base.MemoryKB {
+			v = base.MemoryKB
+		}
+		base.MemoryKB = v
 	}
-	if override.Limits.MaxProcesses > 0 {
-		base.MaxProcesses = override.Limits.MaxProcesses
+	if v := override.Limits.MaxProcesses; v > 0 {
+		if base.MaxProcesses > 0 && v > base.MaxProcesses {
+			v = base.MaxProcesses
+		}
+		base.MaxProcesses = v
 	}
 	return base
 }
