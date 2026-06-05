@@ -1,6 +1,8 @@
 package api
 
 import (
+	"fmt"
+	"path"
 	"strings"
 	"unicode/utf8"
 
@@ -38,7 +40,8 @@ type validationError struct {
 }
 
 func validateRunRequest(req *RunRequest) *validationError {
-	if _, ok := language.Lookup(req.Language); !ok {
+	lang, ok := language.Lookup(req.Language)
+	if !ok {
 		return &validationError{Code: "unknown_language", Message: "language not supported"}
 	}
 	if len(req.Source) == 0 || !utf8.ValidString(req.Source) || len(req.Source) > maxSourceBytes {
@@ -53,7 +56,51 @@ func validateRunRequest(req *RunRequest) *validationError {
 	if len(req.Tests) == 0 {
 		return &validationError{Code: "invalid_tests", Message: "tests must contain at least one entry"}
 	}
+
+	var allowlist []string
+	if lang.Build != nil {
+		allowlist = lang.Build.FlagAllowlist
+	}
+	if req.Build != nil {
+		if verr := validateFlags(req.Build.Flags, req.Language, allowlist); verr != nil {
+			return verr
+		}
+	}
+	if req.Run != nil {
+		if verr := validateFlags(req.Run.Flags, req.Language, allowlist); verr != nil {
+			return verr
+		}
+	}
 	return nil
+}
+
+// validateFlags rejects any flag not matched by the allowlist.
+// A nil allowlist means no flags are permitted for this language.
+// An empty flags slice is always accepted.
+func validateFlags(flags []string, langID string, allowlist []string) *validationError {
+	if len(flags) == 0 {
+		return nil
+	}
+	for _, f := range flags {
+		if !flagAllowed(f, allowlist) {
+			return &validationError{
+				Code:    "disallowed_flag",
+				Message: fmt.Sprintf("flag %s is not allowed for %s", f, langID),
+			}
+		}
+	}
+	return nil
+}
+
+// flagAllowed reports whether flag matches any pattern in the allowlist.
+// Patterns may contain glob wildcards (e.g. -std=* matches -std=c++17).
+func flagAllowed(flag string, allowlist []string) bool {
+	for _, pattern := range allowlist {
+		if matched, err := path.Match(pattern, flag); err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
 
 func validateFilename(name string) *validationError {

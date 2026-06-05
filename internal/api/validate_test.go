@@ -91,11 +91,127 @@ func TestValidateRunRequest(t *testing.T) {
 			req:      RunRequest{Language: "cpp", Source: validSource, ArtifactFilename: strings.Repeat("a", maxFilenameLen+1), Tests: validTests},
 			wantCode: "invalid_filename",
 		},
+
+		// Flag allow-list cases
+		{
+			name:     "cpp allowed flag passes",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"-O2"}}, Tests: validTests},
+			wantCode: "",
+		},
+		{
+			name:     "cpp disallowed flag rejected",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"-fplugin"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "cpp glob match -std=c++17",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"-std=c++17"}}, Tests: validTests},
+			wantCode: "",
+		},
+		{
+			name:     "cpp empty build flags accepted",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{}}, Tests: validTests},
+			wantCode: "",
+		},
+		{
+			name:     "py3 empty flags accepted",
+			req:      RunRequest{Language: "py3", Source: validSource, Run: &PhaseConfig{Flags: []string{}}, Tests: validTests},
+			wantCode: "",
+		},
+		{
+			name:     "py3 no allowlist rejects all flags",
+			req:      RunRequest{Language: "py3", Source: validSource, Run: &PhaseConfig{Flags: []string{"-v"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			verr := validateRunRequest(&tc.req)
+			if tc.wantCode == "" {
+				if verr != nil {
+					t.Fatalf("expected no error, got code=%q message=%q", verr.Code, verr.Message)
+				}
+			} else {
+				if verr == nil {
+					t.Fatalf("expected code %q, got nil", tc.wantCode)
+				}
+				if verr.Code != tc.wantCode {
+					t.Errorf("expected code %q, got %q", tc.wantCode, verr.Code)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateFlags(t *testing.T) {
+	cppAllowlist := []string{"-O0", "-O1", "-O2", "-O3", "-Wall", "-Wextra", "-std=*"}
+
+	cases := []struct {
+		name      string
+		flags     []string
+		allowlist []string
+		wantCode  string
+	}{
+		{
+			name:      "allowed literal flag",
+			flags:     []string{"-O2"},
+			allowlist: cppAllowlist,
+			wantCode:  "",
+		},
+		{
+			name:      "disallowed flag",
+			flags:     []string{"-fplugin"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "glob match -std=c++17",
+			flags:     []string{"-std=c++17"},
+			allowlist: cppAllowlist,
+			wantCode:  "",
+		},
+		{
+			name:      "glob match -std=gnu99",
+			flags:     []string{"-std=gnu99"},
+			allowlist: cppAllowlist,
+			wantCode:  "",
+		},
+		{
+			name:      "empty flags always accepted",
+			flags:     []string{},
+			allowlist: nil,
+			wantCode:  "",
+		},
+		{
+			name:      "nil flags always accepted",
+			flags:     nil,
+			allowlist: nil,
+			wantCode:  "",
+		},
+		{
+			name:      "nil allowlist rejects any flag",
+			flags:     []string{"-O2"},
+			allowlist: nil,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "empty allowlist rejects any flag",
+			flags:     []string{"-O2"},
+			allowlist: []string{},
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "first flag disallowed stops early",
+			flags:     []string{"-fplugin", "-O2"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verr := validateFlags(tc.flags, "cpp", tc.allowlist)
 			if tc.wantCode == "" {
 				if verr != nil {
 					t.Fatalf("expected no error, got code=%q message=%q", verr.Code, verr.Message)
