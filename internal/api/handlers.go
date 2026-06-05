@@ -90,12 +90,8 @@ func run(w http.ResponseWriter, r *http.Request) {
 	var buildResult *BuildResult
 	if lang.Build != nil {
 		buildCmd := resolveTokens(lang.Build.Cmd, srcFilename, artifactFilename)
-		buildArgs := make([]string, len(lang.Build.Args))
-		for j, a := range lang.Build.Args {
-			buildArgs[j] = resolveTokens(a, srcFilename, artifactFilename)
-		}
+		buildArgs := expandArgs(lang.Build.Args, srcFilename, artifactFilename, requestFlags(req.Build))
 		buildLimits := effectiveLimits(lang.Build.Limits, req.Build)
-		buildArgs = append(buildArgs, requestFlags(req.Build)...)
 		wallSec := buildLimits.WallTimeS
 		if wallSec <= 0 {
 			wallSec = 30
@@ -142,11 +138,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 
 	for i, tc := range req.Tests {
 		cmd := resolveTokens(lang.Run.Cmd, srcFilename, artifactFilename)
-		args := make([]string, len(lang.Run.Args))
-		for j, a := range lang.Run.Args {
-			args[j] = resolveTokens(a, srcFilename, artifactFilename)
-		}
-		args = append(args, requestFlags(req.Run)...)
+		args := expandArgs(lang.Run.Args, srcFilename, artifactFilename, requestFlags(req.Run))
 
 		runLimits := effectiveLimits(lang.Run.Limits, req.Run)
 		wallSec := runLimits.WallTimeS
@@ -198,6 +190,22 @@ func resolveTokens(s, sourceFile, artifactFile string) string {
 	s = strings.ReplaceAll(s, "{{source}}", sourceFile)
 	s = strings.ReplaceAll(s, "{{artifact}}", artifactFile)
 	return s
+}
+
+// expandArgs processes a language's arg template list. The {{flags}} element
+// is replaced by the caller-supplied flags slice (expanded inline, or omitted
+// if empty). All other elements go through resolveTokens for {{source}} /
+// {{artifact}} substitution.
+func expandArgs(tmpl []string, sourceFile, artifactFile string, flags []string) []string {
+	out := make([]string, 0, len(tmpl)+len(flags))
+	for _, a := range tmpl {
+		if a == "{{flags}}" {
+			out = append(out, flags...)
+		} else {
+			out = append(out, resolveTokens(a, sourceFile, artifactFile))
+		}
+	}
+	return out
 }
 
 // effectiveLimits applies any per-request limits over the language defaults.

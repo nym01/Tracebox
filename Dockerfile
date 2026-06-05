@@ -11,5 +11,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/goboxd .
+COPY configs/ configs/
 EXPOSE 8080
 CMD ["./goboxd"]

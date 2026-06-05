@@ -5,9 +5,14 @@ import (
 	"net/http"
 
 	"github.com/nym01/goboxd/internal/api"
+	"github.com/nym01/goboxd/internal/language"
 )
 
 func main() {
+	if err := language.LoadRegistry("configs/languages.yaml"); err != nil {
+		log.Fatalf("startup: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

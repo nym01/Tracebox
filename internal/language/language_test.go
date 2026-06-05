@@ -1,6 +1,17 @@
 package language
 
-import "testing"
+import (
+	"log"
+	"os"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	if err := LoadRegistry("../../configs/languages.yaml"); err != nil {
+		log.Fatal(err)
+	}
+	os.Exit(m.Run())
+}
 
 func TestLookupPy3(t *testing.T) {
 	lang, ok := Lookup("py3")
