@@ -69,6 +69,13 @@ type RunResponse struct {
 func run(w http.ResponseWriter, r *http.Request) {
 	incrementJobsTotal()
 
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-r.Context().Done():
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
