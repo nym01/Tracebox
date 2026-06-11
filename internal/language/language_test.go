@@ -181,6 +181,59 @@ func TestLookupJava(t *testing.T) {
 	}
 }
 
+func TestLookupVerilog(t *testing.T) {
+	lang, ok := Lookup("verilog")
+	if !ok {
+		t.Fatal("verilog must be registered")
+	}
+	if lang.ID != "verilog" {
+		t.Errorf("ID: want verilog, got %q", lang.ID)
+	}
+	if lang.Build == nil {
+		t.Fatal("verilog must have a build config")
+	}
+	if lang.Build.Cmd != "/usr/bin/iverilog" {
+		t.Errorf("Build.Cmd: want /usr/bin/iverilog, got %q", lang.Build.Cmd)
+	}
+	if lang.Run.Cmd != "/usr/bin/vvp" {
+		t.Errorf("Run.Cmd: want /usr/bin/vvp, got %q", lang.Run.Cmd)
+	}
+	if lang.SourceFilename != "solution.v" {
+		t.Errorf("SourceFilename: want solution.v, got %q", lang.SourceFilename)
+	}
+	if lang.Artifact != "solution.vvp" {
+		t.Errorf("Artifact: want solution.vvp, got %q", lang.Artifact)
+	}
+	wantAllowlist := []string{"-g2012", "-Wall", "-Wno-timescale"}
+	if len(lang.Build.FlagAllowlist) != len(wantAllowlist) {
+		t.Errorf("Build.FlagAllowlist: want %v, got %v", wantAllowlist, lang.Build.FlagAllowlist)
+	} else {
+		for i, f := range wantAllowlist {
+			if lang.Build.FlagAllowlist[i] != f {
+				t.Errorf("Build.FlagAllowlist[%d]: want %q, got %q", i, f, lang.Build.FlagAllowlist[i])
+			}
+		}
+	}
+	if lang.Build.Limits.WallTimeS != 10 {
+		t.Errorf("Build.Limits.WallTimeS: want 10, got %v", lang.Build.Limits.WallTimeS)
+	}
+	if lang.Build.Limits.MemoryKB != 262144 {
+		t.Errorf("Build.Limits.MemoryKB: want 262144, got %v", lang.Build.Limits.MemoryKB)
+	}
+	if lang.Build.Limits.MaxProcesses != 50 {
+		t.Errorf("Build.Limits.MaxProcesses: want 50, got %v", lang.Build.Limits.MaxProcesses)
+	}
+	if lang.Run.Limits.WallTimeS != 5 {
+		t.Errorf("Run.Limits.WallTimeS: want 5, got %v", lang.Run.Limits.WallTimeS)
+	}
+	if lang.Run.Limits.MemoryKB != 131072 {
+		t.Errorf("Run.Limits.MemoryKB: want 131072, got %v", lang.Run.Limits.MemoryKB)
+	}
+	if lang.Run.Limits.MaxProcesses != 50 {
+		t.Errorf("Run.Limits.MaxProcesses: want 50, got %v", lang.Run.Limits.MaxProcesses)
+	}
+}
+
 func TestLookupUnknown(t *testing.T) {
 	_, ok := Lookup("unknown")
 	if ok {

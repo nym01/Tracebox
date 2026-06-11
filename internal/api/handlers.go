@@ -95,6 +95,9 @@ func run(w http.ResponseWriter, r *http.Request) {
 
 	artifactFilename := req.ArtifactFilename
 	if artifactFilename == "" {
+		artifactFilename = lang.Artifact
+	}
+	if artifactFilename == "" {
 		artifactFilename = "solution"
 	}
 

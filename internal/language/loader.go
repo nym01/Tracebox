@@ -30,6 +30,8 @@ type yamlLanguage struct {
 	ID                       string           `yaml:"id"`
 	Name                     string           `yaml:"name"`
 	SourceFilename           string           `yaml:"source_filename"`
+	Artifact                 string           `yaml:"artifact"`
+	VersionArgs              []string         `yaml:"version_args"`
 	SourceFilenameStrategy   string           `yaml:"source_filename_strategy"`
 	ArtifactFilenameStrategy string           `yaml:"artifact_filename_strategy"`
 	Build                    *yamlBuildConfig `yaml:"build"`
@@ -66,6 +68,8 @@ func LoadRegistry(path string) error {
 			ID:                       yl.ID,
 			Name:                     yl.Name,
 			SourceFilename:           yl.SourceFilename,
+			Artifact:                 yl.Artifact,
+			VersionArgs:              yl.VersionArgs,
 			SourceFilenameStrategy:   yl.SourceFilenameStrategy,
 			ArtifactFilenameStrategy: yl.ArtifactFilenameStrategy,
 			Run: RunConfig{

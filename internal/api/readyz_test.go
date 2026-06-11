@@ -39,7 +39,7 @@ func TestBuildReadyzAllPass(t *testing.T) {
 		{ID: "py3", Name: "Python 3", Run: language.RunConfig{Cmd: "/usr/bin/python3"}},
 		{ID: "cpp", Name: "C++", Run: language.RunConfig{Cmd: "./solution"}, Build: &language.BuildConfig{Cmd: "/usr/bin/g++"}},
 	}
-	probe := func(cmd string) (string, error) {
+	probe := func(cmd string, _ []string) (string, error) {
 		versions := map[string]string{
 			"/usr/bin/python3": "Python 3.11.2",
 			"/usr/bin/g++":    "g++ (Debian 12.2.0) 12.2.0",
@@ -68,7 +68,7 @@ func TestBuildReadyzOneFails(t *testing.T) {
 		{ID: "py3", Name: "Python 3", Run: language.RunConfig{Cmd: "/usr/bin/python3"}},
 		{ID: "java", Name: "Java", Run: language.RunConfig{Cmd: "/usr/bin/java"}, Build: &language.BuildConfig{Cmd: "/usr/bin/javac"}},
 	}
-	probe := func(cmd string) (string, error) {
+	probe := func(cmd string, _ []string) (string, error) {
 		if cmd == "/usr/bin/python3" {
 			return "Python 3.11.2", nil
 		}
@@ -95,7 +95,7 @@ func TestBuildReadyzProbeCmdSelection(t *testing.T) {
 		{ID: "py3", Run: language.RunConfig{Cmd: "/usr/bin/python3"}},
 	}
 	probed := map[string]bool{}
-	probe := func(cmd string) (string, error) {
+	probe := func(cmd string, _ []string) (string, error) {
 		probed[cmd] = true
 		return "v1.0", nil
 	}

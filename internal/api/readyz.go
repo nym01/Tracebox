@@ -33,12 +33,16 @@ func InitReadyz() {
 
 // buildReadyz runs probe for each language and assembles a ReadyzResult.
 // Separated so tests can inject a fake probe.
-func buildReadyz(langs []*language.Language, probe func(string) (string, error)) *ReadyzResult {
+func buildReadyz(langs []*language.Language, probe func(cmd string, args []string) (string, error)) *ReadyzResult {
 	statuses := make(map[string]LanguageStatus, len(langs))
 	allOK := true
 	for _, lang := range langs {
 		cmd := probeCmdFor(lang)
-		ver, err := probe(cmd)
+		args := lang.VersionArgs
+		if len(args) == 0 {
+			args = []string{"--version"}
+		}
+		ver, err := probe(cmd, args)
 		if err != nil {
 			statuses[lang.ID] = LanguageStatus{OK: false, Error: err.Error()}
 			allOK = false
@@ -70,13 +74,17 @@ func parseFirstLine(output string) string {
 	return strings.TrimSpace(output)
 }
 
-// execVersionProbe runs "cmd --version" and returns the first output line.
-func execVersionProbe(cmd string) (string, error) {
+// execVersionProbe runs "cmd args..." and returns the first output line.
+func execVersionProbe(cmd string, args []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, cmd, "--version").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s --version: %w", cmd, err)
+	out, err := exec.CommandContext(ctx, cmd, args...).CombinedOutput()
+	line := parseFirstLine(string(out))
+	if line != "" {
+		return line, nil
 	}
-	return parseFirstLine(string(out)), nil
+	if err != nil {
+		return "", fmt.Errorf("%s %v: %w", cmd, args, err)
+	}
+	return line, nil
 }
