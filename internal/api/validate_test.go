@@ -123,6 +123,38 @@ func TestValidateRunRequest(t *testing.T) {
 			req:      RunRequest{Language: "py3", Source: validSource, Run: &PhaseConfig{Flags: []string{"-v"}}, Tests: validTests},
 			wantCode: "disallowed_flag",
 		},
+
+		// Hole 3 — compiler-flag injection: dangerous patterns must be rejected
+		{
+			name:     "cpp build.flags -fplugin=evil.so rejected",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"-fplugin=evil.so"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "cpp build.flags -Wl,-z,now rejected",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"-Wl,-z,now"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "cpp build.flags @response_file rejected",
+			req:      RunRequest{Language: "cpp", Source: validSource, Build: &PhaseConfig{Flags: []string{"@response_file"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "cpp run.flags -fplugin=evil.so rejected",
+			req:      RunRequest{Language: "cpp", Source: validSource, Run: &PhaseConfig{Flags: []string{"-fplugin=evil.so"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "java build.flags -fplugin=evil.so rejected",
+			req:      RunRequest{Language: "java", Source: validSource, SourceFilename: "Solution.java", ArtifactFilename: "Solution", Build: &PhaseConfig{Flags: []string{"-fplugin=evil.so"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
+		{
+			name:     "verilog build.flags @response_file rejected",
+			req:      RunRequest{Language: "verilog", Source: validSource, Build: &PhaseConfig{Flags: []string{"@response_file"}}, Tests: validTests},
+			wantCode: "disallowed_flag",
+		},
 	}
 
 	for _, tc := range cases {
@@ -204,6 +236,44 @@ func TestValidateFlags(t *testing.T) {
 		{
 			name:      "first flag disallowed stops early",
 			flags:     []string{"-fplugin", "-O2"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+
+		// Hole 3 dangerous patterns
+		{
+			name:      "-fplugin=evil.so rejected",
+			flags:     []string{"-fplugin=evil.so"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "-Wl,-z,now rejected",
+			flags:     []string{"-Wl,-z,now"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "@response_file rejected",
+			flags:     []string{"@response_file"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "-B toolchain override rejected",
+			flags:     []string{"-B/evil/toolchain"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "--specs= rejected",
+			flags:     []string{"--specs=evil.specs"},
+			allowlist: cppAllowlist,
+			wantCode:  "disallowed_flag",
+		},
+		{
+			name:      "-x flag rejected",
+			flags:     []string{"-x"},
 			allowlist: cppAllowlist,
 			wantCode:  "disallowed_flag",
 		},
