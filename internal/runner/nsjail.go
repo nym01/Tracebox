@@ -56,12 +56,22 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 		// exactly as SubprocessRunner does. Other namespaces (pid/net/ipc/uts/user/
 		// cgroup) remain enabled.
 		"--disable_clone_newns",
-	}
-	// nsjail --rlimit_as takes a value in MB. Convert from KB, rounding up so we
-	// never hand the process less than the configured limit.
-	if spec.MemoryKB > 0 {
-		memMB := (spec.MemoryKB + 1023) / 1024
-		nsjailArgs = append(nsjailArgs, "--rlimit_as", strconv.Itoa(memMB))
+		// Give the child a PATH. nsjail starts the child with an empty environment
+		// by default; compiler drivers then fail because they shell out to helper
+		// tools by name — e.g. g++/gcc invoke "ld" and "as" via PATH ("collect2:
+		// fatal error: cannot find 'ld'"). SubprocessRunner inherits the server's
+		// environment, so this restores parity for every language's toolchain.
+		"--env", "PATH=/usr/local/bin:/usr/bin:/bin",
+		// Do NOT cap the virtual address space. --rlimit_as limits *virtual* memory,
+		// not resident memory, and managed runtimes reserve enormous virtual regions
+		// up front regardless of actual use: Node's V8 ("Failed to reserve virtual
+		// memory for CodeRange") and the JVM ("Could not reserve enough space for
+		// object heap" / pthread_create EAGAIN on thread-stack mmap) both abort under
+		// any practical --rlimit_as. nsjail's own default rlimit_as (4 GiB) is also
+		// too small for them, so we explicitly lift it. SubprocessRunner enforces no
+		// memory limit either, so this matches its behavior; real (resident) memory
+		// capping belongs in a cgroup limit, which is a separate hardening step.
+		"--rlimit_as", "max",
 	}
 	// Run inside the per-request working directory so relative artifacts (e.g.
 	// ./solution) and the source file resolve exactly as under SubprocessRunner.
