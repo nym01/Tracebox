@@ -18,6 +18,12 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 
 var defaultRunner runner.Runner = runner.SubprocessRunner{}
 
+// SetRunner replaces the Runner used to execute build and test commands.
+// Called once at startup to select between SubprocessRunner and NsjailRunner.
+func SetRunner(r runner.Runner) {
+	defaultRunner = r
+}
+
 func RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /readyz", readyzHandler)
@@ -140,6 +146,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			Args:        buildArgs,
 			WorkDir:     tmpDir,
 			WallTimeSec: wallSec,
+			MemoryKB:    buildLimits.MemoryKB,
 		})
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
@@ -190,6 +197,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			Stdin:       tc.Stdin,
 			WorkDir:     tmpDir,
 			WallTimeSec: wallSec,
+			MemoryKB:    runLimits.MemoryKB,
 		})
 		if runErr != nil {
 			testResults[i] = TestResult{Status: status.InternalError}

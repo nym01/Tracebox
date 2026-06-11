@@ -9,6 +9,10 @@ type RunSpec struct {
 	Stdin       string
 	WorkDir     string
 	WallTimeSec int
+	// MemoryKB is the address-space limit for the process, in kilobytes.
+	// Zero means "no explicit limit". SubprocessRunner ignores this field
+	// (it only reports peak memory); NsjailRunner enforces it via --rlimit_as.
+	MemoryKB int
 }
 
 // RunResult holds what came back from the subprocess.

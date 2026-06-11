@@ -10,6 +10,7 @@ import (
 
 	"github.com/nym01/goboxd/internal/api"
 	"github.com/nym01/goboxd/internal/language"
+	"github.com/nym01/goboxd/internal/runner"
 )
 
 // Commit is injected at build time via -ldflags "-X main.Commit=$(git rev-parse --short HEAD)".
@@ -48,6 +49,25 @@ func sweepOrphanedJails(baseDir, prefix string, maxAge time.Duration) {
 	}
 }
 
+// selectRunner picks the sandbox implementation from the GOBOXD_RUNNER env var.
+// "nsjail" uses NsjailRunner; anything else (including unset) keeps the
+// SubprocessRunner default so existing behavior is unchanged until nsjail is
+// explicitly opted into.
+func selectRunner() runner.Runner {
+	switch os.Getenv("GOBOXD_RUNNER") {
+	case "nsjail":
+		path := os.Getenv("GOBOXD_NSJAIL_PATH")
+		if path == "" {
+			path = "/usr/local/bin/nsjail"
+		}
+		log.Printf("runner: nsjail (%s)", path)
+		return runner.NsjailRunner{NsjailPath: path}
+	default:
+		log.Println("runner: subprocess")
+		return runner.SubprocessRunner{}
+	}
+}
+
 func main() {
 	sweepOrphanedJails(os.TempDir(), jailDirPrefix, jailMaxAge)
 
@@ -55,6 +75,7 @@ func main() {
 		log.Fatalf("startup: %v", err)
 	}
 	api.SetBuildCommit(Commit)
+	api.SetRunner(selectRunner())
 	api.InitReadyz()
 
 	mux := http.NewServeMux()
