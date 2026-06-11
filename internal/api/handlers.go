@@ -18,6 +18,7 @@ var defaultRunner runner.Runner = runner.SubprocessRunner{}
 func RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /readyz", readyzHandler)
+	mux.HandleFunc("GET /info", infoHandler)
 	mux.HandleFunc("POST /run", run)
 }
 
@@ -63,6 +64,8 @@ type RunResponse struct {
 }
 
 func run(w http.ResponseWriter, r *http.Request) {
+	incrementJobsTotal()
+
 	var req RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON")

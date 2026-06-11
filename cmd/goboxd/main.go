@@ -8,10 +8,14 @@ import (
 	"github.com/nym01/goboxd/internal/language"
 )
 
+// Commit is injected at build time via -ldflags "-X main.Commit=$(git rev-parse --short HEAD)".
+var Commit = "dev"
+
 func main() {
 	if err := language.LoadRegistry("configs/languages.yaml"); err != nil {
 		log.Fatalf("startup: %v", err)
 	}
+	api.SetBuildCommit(Commit)
 	api.InitReadyz()
 
 	mux := http.NewServeMux()
