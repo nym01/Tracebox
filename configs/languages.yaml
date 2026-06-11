@@ -19,3 +19,16 @@ languages:
     run:
       cmd: ./{{artifact}}
       limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64 }
+
+  - id: c
+    name: C
+    source_filename: solution.c
+    artifact: solution
+    build:
+      cmd: /usr/bin/gcc
+      args: ["{{flags}}", "-o", "{{artifact}}", "{{source}}"]
+      limits: { wall_time_s: 3, memory_kb: 1048576, max_processes: 100 }
+      flag_allowlist: ["-O0","-O1","-O2","-O3","-Wall","-Wextra","-std=*"]
+    run:
+      cmd: ./{{artifact}}
+      limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64 }
