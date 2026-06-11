@@ -32,3 +32,11 @@ languages:
     run:
       cmd: ./{{artifact}}
       limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64 }
+
+  - id: bash
+    name: Bash
+    source_filename: solution.sh
+    run:
+      cmd: /usr/bin/bash
+      args: ["{{source}}"]
+      limits: { wall_time_s: 5, memory_kb: 65536, max_processes: 10 }

@@ -88,6 +88,34 @@ func TestLookupC(t *testing.T) {
 	}
 }
 
+func TestLookupBash(t *testing.T) {
+	lang, ok := Lookup("bash")
+	if !ok {
+		t.Fatal("bash must be registered")
+	}
+	if lang.ID != "bash" {
+		t.Errorf("ID: want bash, got %q", lang.ID)
+	}
+	if lang.Build != nil {
+		t.Error("bash must not have a build config")
+	}
+	if lang.Run.Cmd != "/usr/bin/bash" {
+		t.Errorf("Run.Cmd: want /usr/bin/bash, got %q", lang.Run.Cmd)
+	}
+	if lang.SourceFilename != "solution.sh" {
+		t.Errorf("SourceFilename: want solution.sh, got %q", lang.SourceFilename)
+	}
+	if lang.Run.Limits.WallTimeS != 5 {
+		t.Errorf("Run.Limits.WallTimeS: want 5, got %v", lang.Run.Limits.WallTimeS)
+	}
+	if lang.Run.Limits.MemoryKB != 65536 {
+		t.Errorf("Run.Limits.MemoryKB: want 65536, got %v", lang.Run.Limits.MemoryKB)
+	}
+	if lang.Run.Limits.MaxProcesses != 10 {
+		t.Errorf("Run.Limits.MaxProcesses: want 10, got %v", lang.Run.Limits.MaxProcesses)
+	}
+}
+
 func TestLookupUnknown(t *testing.T) {
 	_, ok := Lookup("unknown")
 	if ok {
