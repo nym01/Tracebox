@@ -50,7 +50,7 @@ func TestBuildReadyzAllPass(t *testing.T) {
 		return "", fmt.Errorf("unexpected probe cmd: %s", cmd)
 	}
 
-	result := buildReadyz(langs, probe)
+	result := buildReadyz(langs, "", probe)
 
 	if result.Status != "ok" {
 		t.Errorf("status: want ok, got %q", result.Status)
@@ -75,7 +75,7 @@ func TestBuildReadyzOneFails(t *testing.T) {
 		return "", fmt.Errorf("javac not found at /usr/bin/javac")
 	}
 
-	result := buildReadyz(langs, probe)
+	result := buildReadyz(langs, "", probe)
 
 	if result.Status != "degraded" {
 		t.Errorf("status: want degraded, got %q", result.Status)
@@ -99,7 +99,7 @@ func TestBuildReadyzProbeCmdSelection(t *testing.T) {
 		probed[cmd] = true
 		return "v1.0", nil
 	}
-	buildReadyz(langs, probe)
+	buildReadyz(langs, "", probe)
 
 	if !probed["/usr/bin/g++"] {
 		t.Error("compiled language: expected build cmd /usr/bin/g++ to be probed")
@@ -109,6 +109,55 @@ func TestBuildReadyzProbeCmdSelection(t *testing.T) {
 	}
 	if !probed["/usr/bin/python3"] {
 		t.Error("interpreted language: expected run cmd /usr/bin/python3 to be probed")
+	}
+}
+
+// --- nsjail probe via buildReadyz ---
+
+func TestBuildReadyzNsjailAvailable(t *testing.T) {
+	langs := []*language.Language{}
+	probe := func(cmd string, _ []string) (string, error) {
+		if cmd == "/usr/local/bin/nsjail" {
+			return "3.4", nil
+		}
+		return "", fmt.Errorf("unexpected probe cmd: %s", cmd)
+	}
+
+	result := buildReadyz(langs, "/usr/local/bin/nsjail", probe)
+
+	if result.Status != "ok" {
+		t.Errorf("status: want ok, got %q", result.Status)
+	}
+	if result.Nsjail == nil {
+		t.Fatal("nsjail field should be present")
+	}
+	if !result.Nsjail.OK {
+		t.Errorf("nsjail.ok: want true; error: %s", result.Nsjail.Error)
+	}
+	if result.Nsjail.Version != "3.4" {
+		t.Errorf("nsjail.version: want 3.4, got %q", result.Nsjail.Version)
+	}
+}
+
+func TestBuildReadyzNsjailMissing(t *testing.T) {
+	langs := []*language.Language{}
+	probe := func(cmd string, _ []string) (string, error) {
+		return "", fmt.Errorf("exec: %q: executable file not found in $PATH", cmd)
+	}
+
+	result := buildReadyz(langs, "/usr/local/bin/nsjail", probe)
+
+	if result.Status != "degraded" {
+		t.Errorf("status: want degraded, got %q", result.Status)
+	}
+	if result.Nsjail == nil {
+		t.Fatal("nsjail field should be present")
+	}
+	if result.Nsjail.OK {
+		t.Error("nsjail.ok: want false")
+	}
+	if result.Nsjail.Error == "" {
+		t.Error("nsjail.error: want non-empty")
 	}
 }
 
@@ -177,5 +226,75 @@ func TestReadyzHandlerDegraded(t *testing.T) {
 	}
 	if s := resp.Languages["py3"]; !s.OK {
 		t.Errorf("py3 should still be ok: %+v", s)
+	}
+}
+
+// --- readyzHandler nsjail-specific ---
+
+func TestReadyzHandlerNsjailAvailable(t *testing.T) {
+	orig := cachedReadyz
+	cachedReadyz = &ReadyzResult{
+		Status:    "ok",
+		Nsjail:    &NsjailStatus{OK: true, Version: "3.4"},
+		Languages: map[string]LanguageStatus{},
+	}
+	defer func() { cachedReadyz = orig }()
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	readyzHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	var resp ReadyzResult
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("status: want ok, got %q", resp.Status)
+	}
+	if resp.Nsjail == nil {
+		t.Fatal("nsjail field missing from response")
+	}
+	if !resp.Nsjail.OK {
+		t.Errorf("nsjail.ok: want true")
+	}
+	if resp.Nsjail.Version != "3.4" {
+		t.Errorf("nsjail.version: want 3.4, got %q", resp.Nsjail.Version)
+	}
+}
+
+func TestReadyzHandlerNsjailMissing(t *testing.T) {
+	orig := cachedReadyz
+	cachedReadyz = &ReadyzResult{
+		Status:    "degraded",
+		Nsjail:    &NsjailStatus{OK: false, Error: "nsjail not found"},
+		Languages: map[string]LanguageStatus{},
+	}
+	defer func() { cachedReadyz = orig }()
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	readyzHandler(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d", w.Code)
+	}
+	var resp ReadyzResult
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "degraded" {
+		t.Errorf("status: want degraded, got %q", resp.Status)
+	}
+	if resp.Nsjail == nil {
+		t.Fatal("nsjail field missing from response")
+	}
+	if resp.Nsjail.OK {
+		t.Error("nsjail.ok: want false")
+	}
+	if resp.Nsjail.Error == "" {
+		t.Error("nsjail.error: want non-empty")
 	}
 }

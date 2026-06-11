@@ -74,9 +74,13 @@ func main() {
 	if err := language.LoadRegistry("configs/languages.yaml"); err != nil {
 		log.Fatalf("startup: %v", err)
 	}
+	nsjailPath := os.Getenv("GOBOXD_NSJAIL_PATH")
+	if nsjailPath == "" {
+		nsjailPath = "/usr/local/bin/nsjail"
+	}
 	api.SetBuildCommit(Commit)
 	api.SetRunner(selectRunner())
-	api.InitReadyz()
+	api.InitReadyz(nsjailPath)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

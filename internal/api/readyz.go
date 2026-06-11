@@ -17,23 +17,34 @@ type LanguageStatus struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// NsjailStatus is the probe result for the nsjail binary in GET /readyz.
+type NsjailStatus struct {
+	OK      bool   `json:"ok"`
+	Version string `json:"version,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 // ReadyzResult is the response body for GET /readyz.
 type ReadyzResult struct {
 	Status    string                    `json:"status"`
+	Nsjail    *NsjailStatus             `json:"nsjail,omitempty"`
 	Languages map[string]LanguageStatus `json:"languages"`
 }
 
 var cachedReadyz *ReadyzResult
 
-// InitReadyz probes every registered language and caches the result.
-// Must be called once at startup before serving requests.
-func InitReadyz() {
-	cachedReadyz = buildReadyz(language.All(), execVersionProbe)
+// InitReadyz probes every registered language and the nsjail binary, and
+// caches the result. nsjailPath is the path to the nsjail binary
+// (e.g. /usr/local/bin/nsjail). Must be called once at startup before
+// serving requests.
+func InitReadyz(nsjailPath string) {
+	cachedReadyz = buildReadyz(language.All(), nsjailPath, execVersionProbe)
 }
 
-// buildReadyz runs probe for each language and assembles a ReadyzResult.
+// buildReadyz runs probe for each language and (if nsjailPath is non-empty)
+// for the nsjail binary, and assembles a ReadyzResult.
 // Separated so tests can inject a fake probe.
-func buildReadyz(langs []*language.Language, probe func(cmd string, args []string) (string, error)) *ReadyzResult {
+func buildReadyz(langs []*language.Language, nsjailPath string, probe func(cmd string, args []string) (string, error)) *ReadyzResult {
 	statuses := make(map[string]LanguageStatus, len(langs))
 	allOK := true
 	for _, lang := range langs {
@@ -50,11 +61,27 @@ func buildReadyz(langs []*language.Language, probe func(cmd string, args []strin
 			statuses[lang.ID] = LanguageStatus{OK: true, Version: ver}
 		}
 	}
+
+	var nsjailSt *NsjailStatus
+	if nsjailPath != "" {
+		ver, err := probe(nsjailPath, []string{"--help"})
+		ns := &NsjailStatus{}
+		if err != nil {
+			ns.OK = false
+			ns.Error = err.Error()
+			allOK = false
+		} else {
+			ns.OK = true
+			ns.Version = ver
+		}
+		nsjailSt = ns
+	}
+
 	top := "ok"
 	if !allOK {
 		top = "degraded"
 	}
-	return &ReadyzResult{Status: top, Languages: statuses}
+	return &ReadyzResult{Status: top, Nsjail: nsjailSt, Languages: statuses}
 }
 
 // probeCmdFor picks which binary to probe: build cmd for compiled languages,
