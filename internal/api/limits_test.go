@@ -224,6 +224,61 @@ func TestRunHandlerMissingLimitUsesDefault(t *testing.T) {
 	}
 }
 
+func TestBodyOverMaxSize(t *testing.T) {
+	// Body is the JSON wrapper (~60 bytes) plus 1 MiB of source — exceeds 1 MiB cap.
+	bigSrc := strings.Repeat("a", 1<<20)
+	body := `{"language":"py3","source":"` + bigSrc + `","tests":[{"stdin":"","expected_stdout":""}]}`
+	req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	run(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	var errResp errorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "request_too_large" {
+		t.Errorf("want code request_too_large, got %q", errResp.Error.Code)
+	}
+}
+
+func TestTestStdinOverMaxSize(t *testing.T) {
+	bigStdin := strings.Repeat("x", maxTestFieldBytes+1)
+	body := `{"language":"py3","source":"print('hi')","tests":[{"stdin":"` + bigStdin + `","expected_stdout":"hi\n"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	run(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	var errResp errorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "invalid_tests" {
+		t.Errorf("want code invalid_tests, got %q", errResp.Error.Code)
+	}
+}
+
+func TestTestExpectedStdoutOverMaxSize(t *testing.T) {
+	bigExpected := strings.Repeat("y", maxTestFieldBytes+1)
+	body := `{"language":"py3","source":"print('hi')","tests":[{"stdin":"","expected_stdout":"` + bigExpected + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	run(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	var errResp errorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "invalid_tests" {
+		t.Errorf("want code invalid_tests, got %q", errResp.Error.Code)
+	}
+}
+
 func TestRunHandlerPartialLimitOverride(t *testing.T) {
 	orig := defaultRunner
 	// cpp has build + run phases. Give build a success result, run a success result.

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"github.com/nym01/goboxd/internal/runner"
 	"github.com/nym01/goboxd/internal/status"
 )
+
+const maxBodyBytes = 1 << 20 // 1 MiB
 
 var defaultRunner runner.Runner = runner.SubprocessRunner{}
 
@@ -66,8 +69,14 @@ type RunResponse struct {
 func run(w http.ResponseWriter, r *http.Request) {
 	incrementJobsTotal()
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusBadRequest, "request_too_large", "request body exceeds 1 MiB")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON")
 		return
 	}

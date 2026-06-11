@@ -10,6 +10,7 @@ import (
 )
 
 const maxSourceBytes = 256 * 1024
+const maxTestFieldBytes = 64 * 1024
 const maxFilenameLen = 64
 
 type TestCase struct {
@@ -61,6 +62,14 @@ func validateRunRequest(req *RunRequest) *validationError {
 	}
 	if len(req.Tests) == 0 {
 		return &validationError{Code: "invalid_tests", Message: "tests must contain at least one entry"}
+	}
+	for _, tc := range req.Tests {
+		if len(tc.Stdin) > maxTestFieldBytes {
+			return &validationError{Code: "invalid_tests", Message: "test stdin exceeds 64 KiB"}
+		}
+		if len(tc.ExpectedStdout) > maxTestFieldBytes {
+			return &validationError{Code: "invalid_tests", Message: "test expected_stdout exceeds 64 KiB"}
+		}
 	}
 
 	var allowlist []string
