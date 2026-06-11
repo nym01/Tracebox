@@ -40,3 +40,25 @@ languages:
       cmd: /usr/bin/bash
       args: ["{{source}}"]
       limits: { wall_time_s: 5, memory_kb: 65536, max_processes: 10 }
+
+  - id: js
+    name: JavaScript
+    source_filename: solution.js
+    run:
+      cmd: /usr/bin/node
+      args: ["{{source}}"]
+      limits: { wall_time_s: 5, memory_kb: 262144, max_processes: 50 }
+
+  - id: java
+    name: Java
+    source_filename_strategy: from_request
+    artifact_filename_strategy: from_request
+    build:
+      cmd: /usr/bin/javac
+      args: ["{{flags}}", "{{source}}"]
+      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100 }
+      flag_allowlist: ["-g","-Xlint:all","-Xlint:none"]
+    run:
+      cmd: /usr/bin/java
+      args: ["{{artifact}}"]
+      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100 }

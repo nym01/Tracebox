@@ -47,6 +47,12 @@ func validateRunRequest(req *RunRequest) *validationError {
 	if len(req.Source) == 0 || !utf8.ValidString(req.Source) || len(req.Source) > maxSourceBytes {
 		return &validationError{Code: "invalid_source", Message: "source is missing, not valid UTF-8, or exceeds 256 KiB"}
 	}
+	if lang.SourceFilenameStrategy == "from_request" && req.SourceFilename == "" {
+		return &validationError{Code: "invalid_filename", Message: "source_filename is required for " + lang.ID}
+	}
+	if lang.ArtifactFilenameStrategy == "from_request" && req.ArtifactFilename == "" {
+		return &validationError{Code: "invalid_filename", Message: "artifact_filename is required for " + lang.ID}
+	}
 	if verr := validateFilename(req.SourceFilename); verr != nil {
 		return verr
 	}

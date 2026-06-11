@@ -20,11 +20,13 @@ type RunConfig struct {
 }
 
 type Language struct {
-	ID             string       `json:"id"`
-	Name           string       `json:"name"`
-	SourceFilename string       `json:"source_filename,omitempty"`
-	Build          *BuildConfig `json:"build,omitempty"`
-	Run            RunConfig    `json:"run"`
+	ID                       string       `json:"id"`
+	Name                     string       `json:"name"`
+	SourceFilename           string       `json:"source_filename,omitempty"`
+	SourceFilenameStrategy   string       `json:"source_filename_strategy,omitempty"`
+	ArtifactFilenameStrategy string       `json:"artifact_filename_strategy,omitempty"`
+	Build                    *BuildConfig `json:"build,omitempty"`
+	Run                      RunConfig    `json:"run"`
 }
 
 var registry = map[string]*Language{}

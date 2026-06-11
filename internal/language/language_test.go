@@ -116,6 +116,71 @@ func TestLookupBash(t *testing.T) {
 	}
 }
 
+func TestLookupJS(t *testing.T) {
+	lang, ok := Lookup("js")
+	if !ok {
+		t.Fatal("js must be registered")
+	}
+	if lang.ID != "js" {
+		t.Errorf("ID: want js, got %q", lang.ID)
+	}
+	if lang.Build != nil {
+		t.Error("js must not have a build config")
+	}
+	if lang.Run.Cmd != "/usr/bin/node" {
+		t.Errorf("Run.Cmd: want /usr/bin/node, got %q", lang.Run.Cmd)
+	}
+	if lang.SourceFilename != "solution.js" {
+		t.Errorf("SourceFilename: want solution.js, got %q", lang.SourceFilename)
+	}
+	if lang.Run.Limits.WallTimeS != 5 {
+		t.Errorf("Run.Limits.WallTimeS: want 5, got %v", lang.Run.Limits.WallTimeS)
+	}
+	if lang.Run.Limits.MemoryKB != 262144 {
+		t.Errorf("Run.Limits.MemoryKB: want 262144, got %v", lang.Run.Limits.MemoryKB)
+	}
+	if lang.Run.Limits.MaxProcesses != 50 {
+		t.Errorf("Run.Limits.MaxProcesses: want 50, got %v", lang.Run.Limits.MaxProcesses)
+	}
+}
+
+func TestLookupJava(t *testing.T) {
+	lang, ok := Lookup("java")
+	if !ok {
+		t.Fatal("java must be registered")
+	}
+	if lang.ID != "java" {
+		t.Errorf("ID: want java, got %q", lang.ID)
+	}
+	if lang.Build == nil {
+		t.Fatal("java must have a build config")
+	}
+	if lang.SourceFilename != "" {
+		t.Errorf("SourceFilename: want empty for from_request strategy, got %q", lang.SourceFilename)
+	}
+	if lang.SourceFilenameStrategy != "from_request" {
+		t.Errorf("SourceFilenameStrategy: want from_request, got %q", lang.SourceFilenameStrategy)
+	}
+	if lang.ArtifactFilenameStrategy != "from_request" {
+		t.Errorf("ArtifactFilenameStrategy: want from_request, got %q", lang.ArtifactFilenameStrategy)
+	}
+	if lang.Build.Cmd != "/usr/bin/javac" {
+		t.Errorf("Build.Cmd: want /usr/bin/javac, got %q", lang.Build.Cmd)
+	}
+	if lang.Run.Cmd != "/usr/bin/java" {
+		t.Errorf("Run.Cmd: want /usr/bin/java, got %q", lang.Run.Cmd)
+	}
+	if len(lang.Build.FlagAllowlist) == 0 {
+		t.Error("java Build.FlagAllowlist must not be empty")
+	}
+	if lang.Build.Limits.WallTimeS != 6 {
+		t.Errorf("Build.Limits.WallTimeS: want 6, got %v", lang.Build.Limits.WallTimeS)
+	}
+	if lang.Run.Limits.WallTimeS != 6 {
+		t.Errorf("Run.Limits.WallTimeS: want 6, got %v", lang.Run.Limits.WallTimeS)
+	}
+}
+
 func TestLookupUnknown(t *testing.T) {
 	_, ok := Lookup("unknown")
 	if ok {

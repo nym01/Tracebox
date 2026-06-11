@@ -28,7 +28,7 @@ func TestValidateRunRequest(t *testing.T) {
 		},
 		{
 			name:     "unknown language",
-			req:      RunRequest{Language: "java", Source: validSource, Tests: validTests},
+			req:      RunRequest{Language: "cobol", Source: validSource, Tests: validTests},
 			wantCode: "unknown_language",
 		},
 		{

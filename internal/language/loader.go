@@ -27,11 +27,13 @@ type yamlRunConfig struct {
 }
 
 type yamlLanguage struct {
-	ID             string           `yaml:"id"`
-	Name           string           `yaml:"name"`
-	SourceFilename string           `yaml:"source_filename"`
-	Build          *yamlBuildConfig `yaml:"build"`
-	Run            yamlRunConfig    `yaml:"run"`
+	ID                       string           `yaml:"id"`
+	Name                     string           `yaml:"name"`
+	SourceFilename           string           `yaml:"source_filename"`
+	SourceFilenameStrategy   string           `yaml:"source_filename_strategy"`
+	ArtifactFilenameStrategy string           `yaml:"artifact_filename_strategy"`
+	Build                    *yamlBuildConfig `yaml:"build"`
+	Run                      yamlRunConfig    `yaml:"run"`
 }
 
 type yamlFile struct {
@@ -61,9 +63,11 @@ func LoadRegistry(path string) error {
 			return fmt.Errorf("language registry: entry %d in %s is missing its id", i, path)
 		}
 		lang := &Language{
-			ID:             yl.ID,
-			Name:           yl.Name,
-			SourceFilename: yl.SourceFilename,
+			ID:                       yl.ID,
+			Name:                     yl.Name,
+			SourceFilename:           yl.SourceFilename,
+			SourceFilenameStrategy:   yl.SourceFilenameStrategy,
+			ArtifactFilenameStrategy: yl.ArtifactFilenameStrategy,
 			Run: RunConfig{
 				Cmd:  yl.Run.Cmd,
 				Args: yl.Run.Args,
