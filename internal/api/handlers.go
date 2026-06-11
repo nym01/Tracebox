@@ -17,12 +17,28 @@ var defaultRunner runner.Runner = runner.SubprocessRunner{}
 
 func RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /readyz", readyzHandler)
 	mux.HandleFunc("POST /run", run)
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if cachedReadyz == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"})
+		return
+	}
+	code := http.StatusOK
+	if cachedReadyz.Status != "ok" {
+		code = http.StatusServiceUnavailable
+	}
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(cachedReadyz)
 }
 
 type BuildResult struct {

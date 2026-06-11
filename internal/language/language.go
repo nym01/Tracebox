@@ -37,3 +37,11 @@ func Lookup(id string) (*Language, bool) {
 	l, ok := registry[id]
 	return l, ok
 }
+
+func All() []*Language {
+	out := make([]*Language, 0, len(registry))
+	for _, l := range registry {
+		out = append(out, l)
+	}
+	return out
+}

@@ -12,6 +12,7 @@ func main() {
 	if err := language.LoadRegistry("configs/languages.yaml"); err != nil {
 		log.Fatalf("startup: %v", err)
 	}
+	api.InitReadyz()
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
