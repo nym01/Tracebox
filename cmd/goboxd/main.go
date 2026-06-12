@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -52,8 +53,9 @@ func sweepOrphanedJails(baseDir, prefix string, maxAge time.Duration) {
 // selectRunner picks the sandbox implementation from the GOBOXD_RUNNER env var.
 // "nsjail" uses NsjailRunner; anything else (including unset) keeps the
 // SubprocessRunner default so existing behavior is unchanged until nsjail is
-// explicitly opted into.
-func selectRunner() runner.Runner {
+// explicitly opted into. Constructing the nsjail runner resolves its py3 mount
+// profile up front, so it returns an error the caller should treat as fatal.
+func selectRunner() (runner.Runner, error) {
 	switch os.Getenv("GOBOXD_RUNNER") {
 	case "nsjail":
 		path := os.Getenv("GOBOXD_NSJAIL_PATH")
@@ -61,10 +63,10 @@ func selectRunner() runner.Runner {
 			path = "/usr/local/bin/nsjail"
 		}
 		log.Printf("runner: nsjail (%s)", path)
-		return runner.NsjailRunner{NsjailPath: path}
+		return runner.NewNsjailRunner(context.Background(), path)
 	default:
 		log.Println("runner: subprocess")
-		return runner.SubprocessRunner{}
+		return runner.SubprocessRunner{}, nil
 	}
 }
 
@@ -79,7 +81,11 @@ func main() {
 		nsjailPath = "/usr/local/bin/nsjail"
 	}
 	api.SetBuildCommit(Commit)
-	api.SetRunner(selectRunner())
+	r, err := selectRunner()
+	if err != nil {
+		log.Fatalf("startup: %v", err)
+	}
+	api.SetRunner(r)
 	api.InitReadyz(nsjailPath)
 
 	mux := http.NewServeMux()

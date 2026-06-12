@@ -31,10 +31,35 @@ const pythonInterpreter = "/usr/bin/python3"
 // the sandboxed code cannot see the container's filesystem. Every other language
 // still uses --disable_clone_newns and shares the host filesystem until it gets
 // its own mount profile.
+//
+// The py3 read-only mount list is the same for every request, so it is resolved
+// once at startup (via NewNsjailRunner) and cached in py3Mounts rather than
+// shelling out to ldd on every Run.
 type NsjailRunner struct {
 	// NsjailPath is the path to the nsjail binary. Defaults to "nsjail"
 	// (resolved via PATH) when empty.
 	NsjailPath string
+
+	// py3Mounts holds the resolved read-only --bindmount_ro flag pairs for
+	// py3 (interpreter binary, its shared libraries, and the standard library
+	// directories). It is populated once by NewNsjailRunner and reused by every
+	// request; an empty slice means construction went through the zero value
+	// rather than NewNsjailRunner (used only by the compile-time assertions).
+	py3Mounts []string
+}
+
+// NewNsjailRunner constructs an NsjailRunner with its per-language filesystem
+// mount profiles resolved up front. Today that means the py3 read-only mount
+// list (interpreter, shared libraries, stdlib): resolving it here, once, avoids
+// running ldd per request and surfaces a broken sandbox (e.g. python3 missing)
+// at startup instead of on the first request. The returned error is meant to be
+// fatal to startup, exactly like a failed language-registry load.
+func NewNsjailRunner(ctx context.Context, nsjailPath string) (NsjailRunner, error) {
+	mounts, err := resolvePy3Mounts(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve py3 mounts: %w", err)
+	}
+	return NsjailRunner{NsjailPath: nsjailPath, py3Mounts: mounts}, nil
 }
 
 func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) {
@@ -78,11 +103,7 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 
 	// Filesystem isolation: py3 gets a fresh mount namespace with a minimal
 	// read-only root; every other language still shares the host filesystem.
-	fsArgs, err := filesystemArgs(runCtx, spec)
-	if err != nil {
-		return RunResult{}, err
-	}
-	nsjailArgs = append(nsjailArgs, fsArgs...)
+	nsjailArgs = append(nsjailArgs, r.filesystemArgs(spec)...)
 
 	// Run inside the per-request working directory so relative artifacts (e.g.
 	// ./solution) and the source file resolve exactly as under SubprocessRunner.
@@ -153,30 +174,55 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 // per-request work directory mounted writable. The host root filesystem is never
 // visible, so paths like /etc/passwd simply do not exist inside the sandbox.
 //
+// The read-only py3 mounts are identical for every request, so they are taken
+// from the cache that NewNsjailRunner resolved once at startup. Only the writable
+// work directory varies per request and is appended here.
+//
 // Every other language still gets --disable_clone_newns, which keeps the mount
 // namespace disabled so the child shares the host filesystem (and finds its
 // compiler/interpreter and WorkDir) exactly as before. Those languages will each
 // get their own minimal mount profile in later steps.
-func filesystemArgs(ctx context.Context, spec RunSpec) ([]string, error) {
+func (r NsjailRunner) filesystemArgs(spec RunSpec) []string {
 	if spec.Cmd != pythonInterpreter {
-		return []string{"--disable_clone_newns"}, nil
+		return []string{"--disable_clone_newns"}
 	}
 
+	// Start from a copy of the cached read-only mounts (interpreter, shared
+	// libraries, stdlib) so the per-request work-dir append never mutates the
+	// shared slice.
+	args := append([]string(nil), r.py3Mounts...)
+
+	// The per-request work directory, mounted writable. This is where the source
+	// file was written and where the program may create artifacts. It is the only
+	// writable, non-tmpfs path the sandbox can reach.
+	if spec.WorkDir != "" {
+		args = append(args, "--bindmount", spec.WorkDir)
+	}
+
+	return args
+}
+
+// resolvePy3Mounts builds the static read-only --bindmount_ro flag pairs for
+// py3: the interpreter binary, the shared libraries it is dynamically linked
+// against, and the standard library directories. These never change between
+// requests, so NewNsjailRunner resolves them once at startup and caches the
+// result. It is a package var (not a plain func) so tests can substitute a fake
+// and assert it runs exactly once.
+var resolvePy3Mounts = func(ctx context.Context) ([]string, error) {
 	// Read-only mount of the interpreter binary. /usr/bin/python3 is a symlink
 	// (→ python3.11); resolve it and bind the real file onto the path the command
 	// invokes, so execve(/usr/bin/python3) lands on the real binary regardless of
 	// how nsjail treats a symlink source.
-	var args []string
-	realBin, err := filepath.EvalSymlinks(spec.Cmd)
+	realBin, err := filepath.EvalSymlinks(pythonInterpreter)
 	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", spec.Cmd, err)
+		return nil, fmt.Errorf("resolve %s: %w", pythonInterpreter, err)
 	}
-	args = append(args, "--bindmount_ro", realBin+":"+spec.Cmd)
+	args := []string{"--bindmount_ro", realBin + ":" + pythonInterpreter}
 
 	// Shared libraries the interpreter is dynamically linked against (including
 	// the dynamic loader itself). Without these, execve fails before any Python
 	// code runs.
-	libs, err := sharedLibraries(ctx, spec.Cmd)
+	libs, err := sharedLibraries(ctx, pythonInterpreter)
 	if err != nil {
 		return nil, err
 	}
@@ -184,18 +230,16 @@ func filesystemArgs(ctx context.Context, spec RunSpec) ([]string, error) {
 		args = append(args, "--bindmount_ro", lib)
 	}
 
-	// The Python standard library directory. The interpreter imports os.py and
-	// the lib-dynload C extensions from here at startup; without it Python aborts
-	// with "Could not find platform independent libraries <prefix>".
-	for _, dir := range pythonStdlibDirs() {
-		args = append(args, "--bindmount_ro", dir)
+	// The Python standard library directories. The interpreter imports os.py and
+	// the lib-dynload C extensions from here at startup; without them Python aborts
+	// with "Could not find platform independent libraries <prefix>". A missing
+	// stdlib means the sandbox can never run Python, so fail loudly at startup.
+	dirs := pythonStdlibDirs()
+	if len(dirs) == 0 {
+		return nil, fmt.Errorf("python stdlib directory not found under /usr/lib")
 	}
-
-	// The per-request work directory, mounted writable. This is where the source
-	// file was written and where the program may create artifacts. It is the only
-	// writable, non-tmpfs path the sandbox can reach.
-	if spec.WorkDir != "" {
-		args = append(args, "--bindmount", spec.WorkDir)
+	for _, dir := range dirs {
+		args = append(args, "--bindmount_ro", dir)
 	}
 
 	return args, nil
