@@ -129,3 +129,36 @@ short-lived sandboxes" usage pattern this service has.
 - **Network namespace configuration** was not a focus of the three pillars
   above and needs explicit review — what network access, if any, does
   sandboxed code currently have?
+- **`max_processes` is configured but NOT enforced (process-count limiting is
+  missing).** Every language in `configs/languages.yaml` carries a
+  `max_processes` budget, and the value is parsed (`internal/language`) and even
+  validated on a per-request override (`internal/api` `effectiveLimits`) — but it
+  is then dropped: `runner.RunSpec` has no `MaxProcesses` field, so the runner
+  never receives it, and `buildNsjailArgs` emits no `--cgroup_pids_max` (nor
+  `--rlimit_nproc`), even though the vendored nsjail supports it. The escape suite
+  confirms this (Group 3, test 13): a fork bomb created 2000 processes with zero
+  resistance — nothing capped the count. A submission can therefore spawn
+  arbitrarily many processes, bounded only *incidentally* by the cgroup **memory**
+  limit (each process costs memory), the wall-clock `--time_limit`, or the host's
+  `RLIMIT_NPROC`/`pid_max` — never by the configured per-language value. Blast
+  radius is still contained (the sandbox's PID namespace is torn down on exit/
+  timeout, so children cannot outlive the request or reach host processes), but the
+  intended process-count *limit* does not exist. The fix is mechanical: add
+  `MaxProcesses` to `RunSpec`, plumb it from `effectiveLimits`, and pass
+  `--cgroup_pids_max` in `buildNsjailArgs`.
+- **The cgroup memory limit (`memory.max`) bounds RESIDENT memory only.** This is
+  inherent to how the limit works, not a bug, but it has a sharp edge documented by
+  the escape suite (Group 3, test 12): an allocation that never becomes resident —
+  e.g. a large `MAP_PRIVATE` anonymous mapping that is only read, so its pages map
+  the kernel's uncharged shared zero page — is not caught regardless of size (1 GiB
+  vs a 100 MiB budget). Memory that is actually *used* (written) is charged and
+  OOM-killed immediately, so this is not a resource-exhaustion bypass, but it does
+  mean `memory.max` constrains physical footprint, not virtual address space or
+  untouched allocations.
+- **PID-namespace isolation relies on nsjail's default, not explicit config.** The
+  escape suite (Group 1, test 5) verified the sandbox runs in its own PID namespace
+  (the sandboxed process is pid 1; no host process is visible under `/proc`), which
+  is positive isolation beyond the three named pillars. But it is inherited from
+  nsjail's default behaviour (it clones a fresh PID namespace unless told otherwise)
+  rather than an explicit `--clone_newpid` flag, so it would silently regress if
+  `--disable_clone_newpid` were ever added to the argument builder.
