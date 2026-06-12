@@ -307,3 +307,86 @@ the `ptrace` line returns `accepted` and prints "survived" — isolating the kil
 the `ptrace` call. (Making the py3+ctypes route demonstrate this too would require
 adding `libffi` to the py3 mount profile — a filesystem-isolation change, out of
 scope for the seccomp step.)
+
+## D6 — cgroup v2 memory enforcement: resident, not virtual (Phase 1, step 3)
+
+`memory_exceeded` was in the status vocabulary but never enforced. The hackathon's
+`--rlimit_as` was dropped because it caps **virtual** address space, which the JVM
+and V8 reserve far in excess of their real footprint — any `rlimit_as` tight enough
+to matter aborts them at startup ("Could not reserve enough space for object heap",
+"Failed to reserve virtual memory for CodeRange"). The fix is a cgroup v2
+`memory.max` limit, which tracks **resident** memory: the managed runtime can reserve
+its huge virtual space and still be OOM-killed the instant its real footprint exceeds
+the language's `memory_kb` budget.
+
+### Wiring (uniform, like seccomp)
+
+When `spec.MemoryKB > 0`, `buildNsjailArgs` appends `--use_cgroupv2 --cgroup_mem_max
+<MemoryKB*1024> --cgroup_mem_swap_max 0` to the **shared base args** (not
+`filesystemArgs`), so it applies identically to all seven languages and to both the
+build and run steps, with no per-language branch. nsjail then creates a fresh cgroup
+`<cgroupv2_mount>/NSJAIL.<pid>` for the child and writes `memory.max`. The container
+must run with **`--cgroupns=host`** so nsjail can reach the host cgroup v2 hierarchy
+and enable the memory controller in the root `cgroup.subtree_control`; without it
+every request fails. Documented in the README and `docker-compose.yml`
+(`privileged: true`, `cgroup: host`).
+
+### Why swap must be pinned to 0
+
+`memory.max` alone is a **soft** cap: when RSS hits the limit the kernel first spills
+pages to swap, and only OOM-kills when swap is also exhausted. Under Docker Desktop
+(WSL2 has a swapfile) the Node.js bomb just thrashed swap until the wall clock and was
+misreported as `time_exceeded`. Setting `memory.swap.max = 0`
+(`--cgroup_mem_swap_max 0`) makes the limit a hard RSS cap, so exceeding `memory.max`
+triggers the OOM killer immediately. (py3's single ~8 GiB allocation overwhelmed even
+swap fast enough to OOM without this, which is why it worked before the flag and
+masked the gap.)
+
+### Detecting the OOM kill: the exit code, because the cgroup is already gone
+
+The obvious detector — reading the cgroup's `memory.events` `oom_kill` counter — is
+**unusable here**. nsjail's `reapProc` calls `cgroup2::finishFromParent` (an `rmdir`
+of `NSJAIL.<pid>`) the instant it reaps the child, *before* the nsjail parent exits.
+By the time our `cmd.Wait()` returns the cgroup directory no longer exists, so there
+is nothing to read. Detection therefore uses the **exit code**: nsjail propagates a
+signalled child as `128 + signo` (subproc.cc), and a cgroup OOM kill is SIGKILL → exit
+**137**. `oomKilled(exitCode, timedOut, memLimitKB)` returns true only when
+`exitCode == 137 && !timedOut && memLimitKB > 0`. The handler maps that to
+`memory_exceeded`, checked **before** the generic non-zero-exit → `runtime_error`
+branch (an OOM kill is also a non-zero exit, but more specific).
+
+### Why 137 is unambiguous here despite timeout sharing it
+
+Exactly two things SIGKILL the child: the cgroup OOM killer and nsjail's own
+`--time_limit` at the wall deadline. Both yield 137, but timeouts are already detected
+separately (run duration ≥ wall limit, or the outer-context deadline), so a 137 that
+is *not* a timeout is the OOM killer. Nothing else collides: a seccomp `KILL` is
+SIGSYS → 159, and an ordinary program failure is its own non-zero code. Verified that
+a py3 infinite loop still returns `time_exceeded` (not `memory_exceeded`) with the
+limit active.
+
+### What the three memory bombs actually exercise (and a JVM/Node subtlety)
+
+Verified end-to-end in Docker (`--privileged --cgroupns=host`): py3 (`x=[0]*10**9`),
+js, and java memory bombs all return `memory_exceeded`, while all seven hello-worlds
+return `accepted` (the limits don't break normal programs that fit their budget), the
+py3 `/etc/passwd` read still fails, a cpp build error is `build_failed`, and a py3
+infinite loop is `time_exceeded`. Two non-obvious things surfaced while picking the
+bomb payloads — both about the *workload*, not the sandbox:
+
+1. **A memory bomb must write non-zero bytes to be resident.** `Buffer.alloc(2GB)` in
+   Node was reported `accepted`: `alloc` zero-fills, but the kernel backs read-only
+   zero pages with a single shared zero page, so RSS never grows. The reliable Node
+   bomb is `Buffer.allocUnsafe(n).fill(1)` (or growing an on-heap array), which faults
+   in private dirty pages. py3's `[0]*10**9` works because it's ~8 GiB of list
+   pointers, all resident.
+2. **An on-heap Java bomb may hit the JVM's own limit first.** With container support
+   the JVM sizes its heap from the cgroup limit, so a pure heap bomb can throw
+   `OutOfMemoryError` (→ `runtime_error`) before RSS reaches `memory.max`. Empirically,
+   under the 512 MiB run budget and `swap.max=0`, the array bomb does cross
+   `memory.max` (transient GC copies) and is cgroup-OOM-killed → `memory_exceeded`; a
+   native `Unsafe.allocateMemory`+`setMemory` bomb (off-heap, not bounded by `-Xmx`)
+   is the unambiguous way to drive resident memory past the cap and was confirmed to
+   give `memory_exceeded` too. This is the case `--rlimit_as` fundamentally could not
+   handle: it killed the JVM at startup; the cgroup lets it start and kills it only
+   when real memory is actually over budget.

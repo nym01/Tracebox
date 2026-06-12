@@ -8,11 +8,28 @@ The server uses `net/http` from the Go standard library. It covers everything th
 
 ## Running
 
-Start the service with Docker Compose:
+Start the service with Docker Compose (this enables the nsjail sandbox and the
+`--privileged` / host-cgroup access it needs — see below):
 
 ```
 docker compose up
 ```
+
+Or run the image directly. The nsjail sandbox requires `--privileged` (to create
+namespaces, apply the seccomp filter and bind mounts) and `--cgroupns=host` (so
+nsjail can reach the host cgroup v2 hierarchy to enforce the per-language memory
+limit; without it, memory limits are not enforced and a memory bomb would not be
+reported as `memory_exceeded`):
+
+```
+docker run --privileged --cgroupns=host --rm -p 8080:8080 -e GOBOXD_RUNNER=nsjail tracebox
+```
+
+The host must use **cgroup v2** (the unified hierarchy mounted at
+`/sys/fs/cgroup`). nsjail selects the v2 backend via `--use_cgroupv2` and writes
+`memory.max` for each request. Resident memory — not virtual address space — is
+capped, so the JVM and V8 run normally while still being OOM-killed if their real
+footprint exceeds the language's `memory_kb` budget.
 
 All other operations go through the Makefile:
 

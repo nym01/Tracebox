@@ -3,3 +3,16 @@ services:
     build: .
     ports:
       - "8080:8080"
+    environment:
+      # Use the nsjail sandbox (not the SubprocessRunner fallback).
+      GOBOXD_RUNNER: nsjail
+    # The nsjail sandbox needs elevated access to set up namespaces, bind mounts
+    # and the cgroup v2 memory limit:
+    #   privileged   — nsjail creates mount/pid/net namespaces and applies the
+    #                  seccomp filter and bind mounts for filesystem isolation.
+    #   cgroupns: host — nsjail must reach the host cgroup v2 hierarchy to enable
+    #                  the memory controller and create the per-request memory.max
+    #                  cgroup; without it, --cgroup_mem_max cannot be enforced and
+    #                  memory bombs would not be reported as memory_exceeded.
+    privileged: true
+    cgroup: host

@@ -17,6 +17,27 @@ import (
 // outer context only fires as a backstop if nsjail itself hangs.
 const nsjailGraceSec = 5
 
+// nsjailSIGKILLExit is the exit code nsjail reports when the sandboxed child is
+// terminated by SIGKILL. nsjail propagates a signalled child as 128+signo (see
+// subproc.cc reapProc), and SIGKILL is signal 9. Two things in this sandbox kill
+// the child with SIGKILL: the cgroup OOM killer (when resident memory exceeds
+// memory.max) and nsjail's own --time_limit enforcement at the wall deadline. The
+// two are told apart by the separately-computed timeout flag — see oomKilled.
+const nsjailSIGKILLExit = 128 + 9
+
+// oomKilled reports whether a finished run was killed by the cgroup memory limit,
+// i.e. the result should be memory_exceeded. The cgroup OOM killer sends SIGKILL,
+// which nsjail surfaces as exit code 137. A wall-clock timeout produces the same
+// 137 (nsjail SIGKILLs the child at the deadline), so 137 alone is ambiguous; this
+// attributes it to memory only when the run did NOT time out and a memory limit was
+// actually in force (memLimitKB > 0, so the cgroup was configured). Nothing else in
+// the sandbox yields 137: a seccomp KILL is SIGSYS (159), and an ordinary failure is
+// the program's own non-zero exit code. Kept as a pure function so the mapping is
+// unit-testable without invoking nsjail.
+func oomKilled(exitCode int, timedOut bool, memLimitKB int) bool {
+	return memLimitKB > 0 && !timedOut && exitCode == nsjailSIGKILLExit
+}
+
 // These are the command paths wired to the minimal mount-namespace profile. The
 // interpreted languages (py3, bash, js) each run in a fresh mount namespace with
 // only their binary, shared libraries, and any language-specific extra paths
@@ -263,12 +284,15 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 		Stdout:     string(outW.Bytes()),
 		Stderr:     string(errW.Bytes()),
 		DurationMs: durationMs,
-		// MemoryPeakKB is not yet reported under nsjail: ProcessState.SysUsage
-		// reflects the nsjail wrapper, not the sandboxed child. Left at 0 until
-		// cgroup-based accounting is added in a later step.
+		// MemoryPeakKB is not reported under nsjail: ProcessState.SysUsage
+		// reflects the nsjail wrapper, not the sandboxed child, and the child's
+		// cgroup is torn down by nsjail before we can read memory.peak. Left at 0.
 		MemoryPeakKB: 0,
 		ExitCode:     exitCode,
 		TimedOut:     timedOut,
+		// memory_exceeded detection: a SIGKILL that is not a timeout, while a
+		// cgroup memory limit was in force, is the OOM killer firing (see oomKilled).
+		MemoryExceeded: oomKilled(exitCode, timedOut, spec.MemoryKB),
 	}
 
 	if timedOut {
@@ -307,10 +331,42 @@ func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
 		// memory for CodeRange") and the JVM ("Could not reserve enough space for
 		// object heap" / pthread_create EAGAIN on thread-stack mmap) both abort under
 		// any practical --rlimit_as. nsjail's own default rlimit_as (4 GiB) is also
-		// too small for them, so we explicitly lift it. SubprocessRunner enforces no
-		// memory limit either, so this matches its behavior; real (resident) memory
-		// capping belongs in a cgroup limit, which is a separate hardening step.
+		// too small for them, so we explicitly lift it. Real (resident) memory is
+		// capped instead by the cgroup v2 limit appended below.
 		"--rlimit_as", "max",
+	}
+
+	// Real (resident) memory enforcement via a cgroup v2 memory limit. This is the
+	// counterpart to lifting --rlimit_as above: memory.max caps RESIDENT memory, so
+	// a managed runtime can reserve its enormous virtual address space yet still be
+	// OOM-killed the instant its real footprint exceeds the language's memory_kb
+	// budget — exactly what --rlimit_as could not do for the JVM and V8. nsjail
+	// places the child in a fresh cgroup (<cgroupv2_mount>/NSJAIL.<pid>) and writes
+	// memory.max = MemoryKB*1024 bytes; when the kernel OOM-kills the child it dies
+	// by SIGKILL and nsjail exits 137, which Run maps to memory_exceeded via
+	// oomKilled. The limit is applied uniformly to every language (it is in the
+	// shared base args, keyed only off spec.MemoryKB, with no per-language branch),
+	// and to both the build and run steps. It is skipped when no limit is set
+	// (MemoryKB == 0), e.g. the zero-value runner used by the compile-time assertions.
+	//
+	// This requires the container to run with --cgroupns=host so nsjail can reach the
+	// host cgroup v2 hierarchy and enable the memory controller in the root
+	// cgroup.subtree_control; that deployment requirement is documented in the README
+	// and docker-compose.yml. --use_cgroupv2 selects the v2 backend; the v2 mount
+	// path defaults to /sys/fs/cgroup, which is correct under --cgroupns=host.
+	if spec.MemoryKB > 0 {
+		args = append(args,
+			"--use_cgroupv2",
+			"--cgroup_mem_max", strconv.Itoa(spec.MemoryKB*1024),
+			// Forbid swap for the cgroup (memory.swap.max = 0). Without this the
+			// limit is soft: when resident memory hits memory.max the kernel spills
+			// pages to swap instead of OOM-killing, so a memory bomb just thrashes
+			// until the wall-clock limit and is misreported as time_exceeded rather
+			// than memory_exceeded (observed for the Node.js bomb, whose 50 MiB
+			// chunks paged out happily). With swap pinned to 0 the limit is hard:
+			// exceeding memory.max triggers the OOM killer immediately.
+			"--cgroup_mem_swap_max", "0",
+		)
 	}
 
 	// Seccomp syscall filter, applied UNIFORMLY to every language. The kafel

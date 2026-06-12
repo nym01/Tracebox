@@ -96,6 +96,57 @@ func TestTimeExceeded(t *testing.T) {
 	}
 }
 
+// TestMemoryExceeded confirms a run the nsjail runner flagged as OOM-killed
+// (MemoryExceeded, which also carries a non-zero SIGKILL exit code) is reported as
+// memory_exceeded — and that the more specific memory status wins over the generic
+// runtime_error the non-zero exit code would otherwise produce.
+func TestMemoryExceeded(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &fakeRunner{result: runner.RunResult{MemoryExceeded: true, ExitCode: 137}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"x=[0]*10**9","tests":[{"stdin":"","expected_stdout":""}]}`
+	w := postRun(t, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "memory_exceeded" {
+		t.Errorf("top-level status: want memory_exceeded, got %q", resp.Status)
+	}
+	if len(resp.Tests) != 1 {
+		t.Fatalf("want 1 test result, got %d", len(resp.Tests))
+	}
+	if resp.Tests[0].Status != "memory_exceeded" {
+		t.Errorf("tests[0].status: want memory_exceeded, got %q", resp.Tests[0].Status)
+	}
+}
+
+// TestTimeoutWinsOverMemoryExceeded confirms ordering: if a run both timed out and
+// would otherwise look OOM-killed, the timeout status takes precedence (the runner
+// only sets MemoryExceeded when !TimedOut, but the handler ordering is asserted here
+// too as a guard).
+func TestTimeoutWinsOverMemoryExceeded(t *testing.T) {
+	orig := defaultRunner
+	defaultRunner = &fakeRunner{result: runner.RunResult{TimedOut: true, MemoryExceeded: true, ExitCode: 137}}
+	defer func() { defaultRunner = orig }()
+
+	body := `{"language":"py3","source":"while True: pass","tests":[{"stdin":"","expected_stdout":""}]}`
+	w := postRun(t, body)
+
+	var resp RunResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Tests[0].Status != "time_exceeded" {
+		t.Errorf("tests[0].status: want time_exceeded, got %q", resp.Tests[0].Status)
+	}
+}
+
 func TestBuildFailed(t *testing.T) {
 	orig := defaultRunner
 	defaultRunner = &fakeRunner{result: runner.RunResult{ExitCode: 1, Stderr: "error: expected ';'"}}

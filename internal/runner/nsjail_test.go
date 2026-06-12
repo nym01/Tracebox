@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -815,6 +817,160 @@ func TestSeccompPolicyPassedToNsjailForEveryLanguage(t *testing.T) {
 			t.Fatalf("unknown command: --seccomp_policy missing: %v", args)
 		}
 	})
+}
+
+// flagValue returns the argument immediately following the first occurrence of
+// flag in args, and whether the flag was present. Used to assert the value passed
+// to a flag like --cgroup_mem_max.
+func flagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+func hasFlag(args []string, flag string) bool {
+	return slices.Contains(args, flag)
+}
+
+// TestOOMKilled is the core unit test for the memory_exceeded detection logic. The
+// cgroup OOM killer surfaces as nsjail exit code 137 (128+SIGKILL); the same 137 is
+// produced by a wall-clock timeout, so the classifier must attribute it to memory
+// ONLY when the run did not time out and a memory limit was actually in force.
+func TestOOMKilled(t *testing.T) {
+	cases := []struct {
+		name       string
+		exitCode   int
+		timedOut   bool
+		memLimitKB int
+		want       bool
+	}{
+		{"oom kill under a limit", 137, false, 102400, true},
+		{"137 but timed out is a timeout, not oom", 137, true, 102400, false},
+		{"137 with no memory limit is not attributed to oom", 137, false, 0, false},
+		{"clean exit is not oom", 0, false, 102400, false},
+		{"ordinary runtime error is not oom", 1, false, 102400, false},
+		{"seccomp kill (SIGSYS -> 159) is not oom", 159, false, 102400, false},
+		{"other signal exit is not oom", 143, false, 102400, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := oomKilled(c.exitCode, c.timedOut, c.memLimitKB); got != c.want {
+				t.Fatalf("oomKilled(%d, %v, %d) = %v, want %v",
+					c.exitCode, c.timedOut, c.memLimitKB, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCgroupMemLimitPassedToNsjail verifies the cgroup v2 memory limit is wired into
+// the nsjail args from spec.MemoryKB: --use_cgroupv2 is present, --cgroup_mem_max is
+// the limit converted from KB to BYTES, and both appear before the "--" separator so
+// they configure nsjail rather than being handed to the sandboxed command.
+func TestCgroupMemLimitPassedToNsjail(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	const memKB = 102400 // py3's limit; 100 MiB
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: memKB}, 10)
+
+	if !hasFlag(args, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 missing from nsjail args: %v", args)
+	}
+	got, ok := flagValue(args, "--cgroup_mem_max")
+	if !ok {
+		t.Fatalf("--cgroup_mem_max missing from nsjail args: %v", args)
+	}
+	if want := strconv.Itoa(memKB * 1024); got != want {
+		t.Fatalf("--cgroup_mem_max = %q, want %q (bytes, i.e. memory_kb*1024)", got, want)
+	}
+
+	// Swap must be pinned to 0 so the memory limit is a hard RSS cap (otherwise the
+	// kernel spills to swap and a memory bomb is misreported as time_exceeded).
+	if sw, ok := flagValue(args, "--cgroup_mem_swap_max"); !ok || sw != "0" {
+		t.Fatalf("--cgroup_mem_swap_max = %q (present=%v), want \"0\"", sw, ok)
+	}
+
+	// The cgroup flags must configure nsjail, so they precede the "--" separator.
+	sep := -1
+	for i, a := range args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 {
+		t.Fatalf("no \"--\" separator in args: %v", args)
+	}
+	for _, flag := range []string{"--use_cgroupv2", "--cgroup_mem_max"} {
+		idx := -1
+		for i, a := range args {
+			if a == flag {
+				idx = i
+				break
+			}
+		}
+		if idx > sep {
+			t.Fatalf("%s (idx %d) appears after \"--\" (idx %d)", flag, idx, sep)
+		}
+	}
+}
+
+// TestCgroupMemLimitAppliedToEveryLanguage confirms the memory limit is uniform:
+// every language's command variant gets --cgroup_mem_max when its spec carries a
+// MemoryKB, with no per-language exemption (mirrors the seccomp uniformity test).
+func TestCgroupMemLimitAppliedToEveryLanguage(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	commands := map[string]string{
+		"py3":           pythonInterpreter,
+		"bash":          bashInterpreter,
+		"js":            nodeInterpreter,
+		"cpp build":     cppCompiler,
+		"c build":       cCompiler,
+		"compiled run":  "./solution",
+		"java build":    javacCompiler,
+		"java run":      javaRuntime,
+		"verilog build": iverilogCompiler,
+		"verilog run":   vvpRuntime,
+	}
+	for name, cmd := range commands {
+		t.Run(name, func(t *testing.T) {
+			args := r.buildNsjailArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/work", MemoryKB: 65536}, 10)
+			got, ok := flagValue(args, "--cgroup_mem_max")
+			if !ok {
+				t.Fatalf("%s: --cgroup_mem_max missing: %v", cmd, args)
+			}
+			if want := strconv.Itoa(65536 * 1024); got != want {
+				t.Fatalf("%s: --cgroup_mem_max = %q, want %q", cmd, got, want)
+			}
+		})
+	}
+}
+
+// TestCgroupMemLimitOmittedWhenUnset confirms that with no memory limit set
+// (MemoryKB == 0) no cgroup flags are emitted — there is nothing to enforce, and
+// the zero-value runner used by the compile-time assertions must not require cgroups.
+func TestCgroupMemLimitOmittedWhenUnset(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work"}, 10)
+	if hasFlag(args, "--use_cgroupv2") || hasFlag(args, "--cgroup_mem_max") {
+		t.Fatalf("expected no cgroup flags when MemoryKB is 0, got: %v", args)
+	}
 }
 
 // TestParseIncludeDirs checks the header-search block is extracted from

@@ -205,11 +205,17 @@ func run(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var ts string
-		if result.TimedOut {
+		switch {
+		case result.TimedOut:
 			ts = status.TimeExceeded
-		} else if result.ExitCode != 0 {
+		case result.MemoryExceeded:
+			// The cgroup OOM killer fired. Checked before the generic non-zero
+			// exit below, because an OOM kill also surfaces as a non-zero
+			// (SIGKILL) exit code but is a distinct, more specific outcome.
+			ts = status.MemoryExceeded
+		case result.ExitCode != 0:
 			ts = status.RuntimeError
-		} else {
+		default:
 			ts = compare.Compare(result.Stdout, tc.ExpectedStdout)
 		}
 
