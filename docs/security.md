@@ -129,23 +129,28 @@ short-lived sandboxes" usage pattern this service has.
 - **Network namespace configuration** was not a focus of the three pillars
   above and needs explicit review — what network access, if any, does
   sandboxed code currently have?
-- **`max_processes` is configured but NOT enforced (process-count limiting is
-  missing).** Every language in `configs/languages.yaml` carries a
-  `max_processes` budget, and the value is parsed (`internal/language`) and even
-  validated on a per-request override (`internal/api` `effectiveLimits`) — but it
-  is then dropped: `runner.RunSpec` has no `MaxProcesses` field, so the runner
-  never receives it, and `buildNsjailArgs` emits no `--cgroup_pids_max` (nor
-  `--rlimit_nproc`), even though the vendored nsjail supports it. The escape suite
-  confirms this (Group 3, test 13): a fork bomb created 2000 processes with zero
-  resistance — nothing capped the count. A submission can therefore spawn
-  arbitrarily many processes, bounded only *incidentally* by the cgroup **memory**
-  limit (each process costs memory), the wall-clock `--time_limit`, or the host's
-  `RLIMIT_NPROC`/`pid_max` — never by the configured per-language value. Blast
-  radius is still contained (the sandbox's PID namespace is torn down on exit/
-  timeout, so children cannot outlive the request or reach host processes), but the
-  intended process-count *limit* does not exist. The fix is mechanical: add
-  `MaxProcesses` to `RunSpec`, plumb it from `effectiveLimits`, and pass
-  `--cgroup_pids_max` in `buildNsjailArgs`.
+- **Process-count limiting (`max_processes`) is enforced via a cgroup v2
+  `pids.max` limit.** Every language in `configs/languages.yaml` carries a
+  `max_processes` budget; it is parsed (`internal/language`), clamped on a
+  per-request override (`internal/api` `effectiveLimits`), carried on
+  `runner.RunSpec.MaxProcesses`, and emitted by `buildNsjailArgs` as
+  `--cgroup_pids_max <max_processes>` — uniformly, for every language and for both
+  the build and run steps. nsjail writes the value to the child cgroup's `pids.max`
+  (`external/nsjail/cgroup2.cc`). This was a real gap in the first pass of the escape
+  suite (the value was parsed but never reached the runner) and is now closed; the
+  suite (Group 3, test 13) verifies it: a bounded fork bomb's `fork()` fails with
+  `EAGAIN` at the configured count (c's run budget of 64) rather than running to its
+  2000-process self-cap. Note the *semantics* differ from the memory limit: exceeding
+  `pids.max` does **not** OOM-kill the process — the kernel fails the next
+  `fork()`/`clone()` with `EAGAIN`, so the sandboxed program observes a failed syscall
+  and typically exits non-zero, which the API reports as `runtime_error` (not a
+  dedicated `process_limit_exceeded` status — an `EAGAIN`-from-`pids.max` is
+  indistinguishable from any other non-zero exit, with no signal like OOM's 137 to key
+  off). Blast-radius containment is independent and also holds: the sandbox's PID
+  namespace is torn down on exit/timeout, so children cannot outlive the request or
+  reach host processes. Normal compilation is unaffected — compiled-language build
+  steps fork internal subprocesses (gcc/g++ → cc1/as/ld; iverilog → ivlpp/ivl), but
+  the build budgets (100 for c/cpp/java, 50 for verilog) leave ample headroom.
 - **The cgroup memory limit (`memory.max`) bounds RESIDENT memory only.** This is
   inherent to how the limit works, not a bug, but it has a sharp edge documented by
   the escape suite (Group 3, test 12): an allocation that never becomes resident —

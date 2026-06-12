@@ -18,8 +18,13 @@ import (
 // Tests 11 and 12 probe two sides of that mechanism: a resident bomb that must be
 // caught (11) and a zero-page allocation that, by design, is NOT resident and so
 // documents a real boundary of memory.max accounting (12). Test 13 leaves the
-// memory pillar entirely and asks whether process-count is limited at all — the
-// max_processes field in the YAML — which turns out to be a real gap.
+// memory pillar entirely and targets process-count: the max_processes field in the
+// YAML, now enforced as a cgroup v2 pids.max limit (--cgroup_pids_max). It was a
+// real gap in the first pass of this suite — parsed and validated but never wired
+// into the runner — and is now fixed: RunSpec carries MaxProcesses, handlers.go
+// plumbs it from effectiveLimits, and buildNsjailArgs emits --cgroup_pids_max
+// uniformly (see internal/runner/nsjail.go). Test 13 now asserts the bomb is
+// BOUNDED at the configured count.
 
 // Test 11 — resident-memory bomb (py3 and java).
 //
@@ -167,42 +172,42 @@ print("READ_DONE", acc, flush=True)
 	}
 }
 
-// Test 13 — fork bomb: process-count limiting (max_processes) is NOT enforced.
+// Test 13 — fork bomb: process-count limiting (max_processes) IS enforced.
 //
 // This test leaves the memory pillar and targets process COUNT. Every language in
-// configs/languages.yaml carries a max_processes budget (c's run step: 64), and
-// the intent was clearly to cap the number of processes a submission can spawn.
+// configs/languages.yaml carries a max_processes budget (c's run step: 64), enforced
+// as a cgroup v2 pids.max limit: RunSpec carries MaxProcesses, handlers.go plumbs it
+// from effectiveLimits, and buildNsjailArgs emits --cgroup_pids_max (the vendored
+// nsjail writes pids.max in external/nsjail/cgroup2.cc).
 //
-// A pre-run audit of the code shows that intent was never connected to any
-// enforcement:
-//   - max_processes IS parsed (internal/language/loader.go) and even validated on
-//     a per-request override (internal/api/handlers.go effectiveLimits),
-//   - but runner.RunSpec has NO MaxProcesses field — only WallTimeSec and MemoryKB —
-//     so handlers.go drops the value when it builds the spec, and
-//   - buildNsjailArgs (internal/runner/nsjail.go) emits no --cgroup_pids_max and no
-//     --rlimit_nproc. The vendored nsjail fully supports --cgroup_pids_max
-//     (external/nsjail/cgroup2.cc writes pids.max); the runner simply never passes it.
+// How the limit surfaces is the key subtlety. Unlike the memory limit — where the
+// kernel OOM-kills the child (SIGKILL → nsjail exit 137 → memory_exceeded) — hitting
+// pids.max does NOT kill anything: the kernel simply fails the next fork()/clone()
+// with EAGAIN. The sandboxed program sees that failed syscall and decides what to do.
+// This program treats a failed fork as fatal and exits NON-ZERO, so the API maps it
+// to runtime_error (there is no dedicated "process_limit_exceeded" status, and the
+// runner could not infer one: an EAGAIN-from-pids is indistinguishable from any other
+// non-zero exit — there is no signal like OOM's 137 to key off).
 //
-// So max_processes is dead config. The PREDICTION (confirmed by the run below) is
-// that a fork bomb is NOT cleanly capped at 64; it is bounded only incidentally —
-// by the cgroup MEMORY limit (each retained child costs memory → memory_exceeded),
-// the wall-clock --time_limit (→ time_exceeded), or nsjail's inherited soft
-// RLIMIT_NPROC. None of those is the configured per-language process count.
+// Holds (expected): fork() fails with EAGAIN once the cgroup reaches pids.max, far
+// below the self-cap — c's run budget is 64, and the cgroup holds the run process
+// plus its children, so the failure lands at created≈63 (1 parent + 63 children =
+// 64 tasks). The program prints FORK_FAILED with errno=11 (EAGAIN) and exits 1 →
+// runtime_error. CAP_REACHED must NOT appear — reaching the self-cap would mean the
+// limit never fired.
 //
-// What still HOLDS is containment of blast radius, not the count limit: the sandbox
-// runs in its own PID namespace (Group 1, test 5), so when nsjail exits or hits the
-// wall limit it tears the namespace down and every spawned child dies with it — the
-// bomb cannot outlive the request or reach host processes. The test confirms the
-// container survives (a trivial run still succeeds afterwards).
+// What also HOLDS is containment of blast radius: the sandbox runs in its own PID
+// namespace (Group 1, test 5), so even the bounded children die with the namespace
+// when nsjail exits. The test confirms the container survives (a trivial run still
+// succeeds afterwards).
 //
-// The fork bomb is deliberately BOUNDED: only the parent forks (children just
-// sleep, they do not recursively fork, so growth is linear not exponential), and it
-// self-caps at forkBombCap — far above c's 64 budget, low enough not to threaten the
-// host's task table, and moot anyway because the wall limit kills the namespace in a
-// few seconds. Reaching the cap, or being stopped by memory/time, both prove the
-// same thing: nothing capped it at 64.
+// The fork bomb is deliberately BOUNDED: only the parent forks (children just sleep,
+// they do not recursively fork, so growth is linear not exponential), and it self-caps
+// at forkBombCap — far above c's 64 budget. With max_processes enforced the cap is now
+// unreachable; reaching it would be the failure signal that the limit is missing.
 func TestForkBombProcessLimit(t *testing.T) {
-	const forkBombCap = 2000 // >> c-run max_processes (64); children die with the PID ns
+	const forkBombCap = 2000    // >> c-run max_processes (64); must NOT be reached now
+	const cRunMaxProcesses = 64 // configs/languages.yaml: c.run.limits.max_processes
 	const src = `
 #include <stdio.h>
 #include <unistd.h>
@@ -213,9 +218,12 @@ int main(void){
     while (created < ` + "2000" + `) {
         pid_t p = fork();
         if (p < 0) {
+            // pids.max reached: fork() returns EAGAIN. Treat it as fatal and exit
+            // NON-ZERO so the run is reported as runtime_error (the process is not
+            // killed — the kernel just refuses the syscall).
             printf("FORK_FAILED created=%d errno=%d(%s)\n", created, errno, strerror(errno));
             fflush(stdout);
-            return 0;
+            return 1;
         }
         if (p == 0) {
             // Child: hold a process slot, then exit. The run's wall limit kills the
@@ -240,46 +248,56 @@ int main(void){
 		t.Fatalf("fork bomb: C build did not succeed (status %q, stderr %q)", build.Status, build.Stderr)
 	}
 
-	// Interpret which mechanism (if any) stopped the bomb. The point of the test is
-	// to record this honestly, not to assert a single "correct" status — there is a
-	// real gap here, so the finding is the result.
-	switch run.Status {
-	case "memory_exceeded":
-		t.Logf("FINDING: stopped by the cgroup MEMORY limit, not a process-count limit — "+
-			"the retained children's memory tripped memory.max. max_processes (64) played no role. stdout-tail=%q",
-			lastLines(run.Stdout, 3))
-	case "time_exceeded":
-		t.Logf("FINDING: stopped by the wall-clock --time_limit, not a process-count limit — " +
-			"forking ran until the deadline. max_processes (64) played no role.")
-	case "runtime_error":
-		// fork() eventually returned <0. Confirm it was NOT the configured 64 — i.e.
-		// the bound was the host's RLIMIT_NPROC/pid_max, not max_processes.
-		t.Logf("FINDING: fork() eventually failed (RLIMIT_NPROC / host pid_max), not the configured "+
-			"max_processes=64. stdout-tail=%q", lastLines(run.Stdout, 3))
-		if strings.Contains(run.Stdout, "FORK_FAILED created=6") && !strings.Contains(run.Stdout, "created=60") {
-			t.Logf("note: fork failed near a low count — inspect whether a limit near 64 was hit")
-		}
-	case "accepted", "wrong_output":
-		t.Logf("FINDING: the bomb reached its self-cap of %d processes with NO failure — there is no "+
-			"process-count limit at all below %d. max_processes=64 is unenforced. stdout-tail=%q",
+	// The bomb must NOT have reached its self-cap: that would mean nothing limited the
+	// process count (the original gap). With pids.max enforced this is impossible.
+	if strings.Contains(run.Stdout, "CAP_REACHED") {
+		t.Fatalf("REGRESSION: the bomb reached its self-cap of %d processes — max_processes is NOT "+
+			"enforced (no pids.max limit fired below %d). stdout-tail=%q",
 			forkBombCap, forkBombCap, lastLines(run.Stdout, 3))
 	}
 
-	// The actual gap assertion: a clean process-count limit at the configured value
-	// would have surfaced as fork() failing with EAGAIN at ~64 (a runtime_error whose
-	// output shows created≈64). If we ever see exactly that, max_processes has been
-	// wired up and THIS test's finding (and docs/security.md) must be updated.
-	if strings.Contains(run.Stdout, "FORK_FAILED") {
-		var failedAt int
-		// Parse "FORK_FAILED created=N" loosely.
-		if i := strings.Index(run.Stdout, "FORK_FAILED created="); i >= 0 {
-			_, _ = fmtSscanCreated(run.Stdout[i:], &failedAt)
-		}
-		if failedAt > 0 && failedAt <= 120 {
-			t.Errorf("UNEXPECTED: fork failed at created=%d, near c's max_processes=64 — a process-count "+
-				"limit may now be enforced. If so this is GOOD, but the test's finding and docs/security.md "+
-				"must be updated to reflect that max_processes is now wired up.", failedAt)
-		}
+	// fork() must have failed (EAGAIN from pids.max), and the program exited non-zero,
+	// so the run is runtime_error. A timeout/OOM here would mean the count was bounded
+	// only incidentally rather than by the configured limit — surface that distinction.
+	switch run.Status {
+	case "runtime_error":
+		// expected: fork() hit pids.max and the program exited 1.
+	case "memory_exceeded":
+		t.Errorf("the bomb was stopped by the MEMORY limit, not the process-count limit — "+
+			"max_processes did not fire first; stdout-tail=%q", lastLines(run.Stdout, 3))
+	case "time_exceeded":
+		t.Errorf("the bomb ran until the wall-clock limit rather than hitting pids.max — " +
+			"the process-count limit did not fire first")
+	default:
+		t.Errorf("expected runtime_error (fork() → EAGAIN at pids.max, exit 1), got %q; stdout-tail=%q stderr=%q",
+			run.Status, lastLines(run.Stdout, 3), run.Stderr)
+	}
+
+	// The bound must be the CONFIGURED process count, not some incidental host limit.
+	// A clean pids.max=64 surfaces as fork() failing at created≈63 with errno 11
+	// (EAGAIN). Assert FORK_FAILED is present, the errno is EAGAIN, and the count is
+	// in the neighbourhood of the configured 64 (well below the self-cap).
+	if !strings.Contains(run.Stdout, "FORK_FAILED") {
+		t.Fatalf("expected FORK_FAILED in output (fork() should hit pids.max); stdout=%q", run.Stdout)
+	}
+	if !strings.Contains(run.Stdout, "errno=11") {
+		t.Errorf("expected fork() to fail with EAGAIN (errno=11) from pids.max, got a different errno; stdout-tail=%q",
+			lastLines(run.Stdout, 3))
+	}
+	var failedAt int
+	if i := strings.Index(run.Stdout, "FORK_FAILED created="); i >= 0 {
+		_, _ = fmtSscanCreated(run.Stdout[i:], &failedAt)
+	}
+	// Allow a small margin around the configured 64: the cgroup counts the run process
+	// itself plus a possible transient, so the exact failing count can be a hair under
+	// or over 64, but it must be nowhere near the 2000 self-cap.
+	if failedAt <= 0 || failedAt > cRunMaxProcesses+16 {
+		t.Errorf("fork failed at created=%d, but the configured limit is max_processes=%d — the bound "+
+			"does not match the per-language process count (expected ~%d, far below the %d self-cap)",
+			failedAt, cRunMaxProcesses, cRunMaxProcesses, forkBombCap)
+	} else {
+		t.Logf("BOUNDED: fork() failed at created=%d (EAGAIN), matching c's max_processes=%d — pids.max enforced.",
+			failedAt, cRunMaxProcesses)
 	}
 
 	// Containment check: the bomb must not have taken the service down. A trivial run

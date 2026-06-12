@@ -350,13 +350,17 @@ func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
 	// (MemoryKB == 0), e.g. the zero-value runner used by the compile-time assertions.
 	//
 	// This requires the container to run with --cgroupns=host so nsjail can reach the
-	// host cgroup v2 hierarchy and enable the memory controller in the root
+	// host cgroup v2 hierarchy and enable the memory/pids controllers in the root
 	// cgroup.subtree_control; that deployment requirement is documented in the README
 	// and docker-compose.yml. --use_cgroupv2 selects the v2 backend; the v2 mount
-	// path defaults to /sys/fs/cgroup, which is correct under --cgroupns=host.
+	// path defaults to /sys/fs/cgroup, which is correct under --cgroupns=host. It is
+	// emitted once if EITHER cgroup limit is in force (memory or process-count), since
+	// both flow through the same v2 backend and nsjail only needs the flag once.
+	if spec.MemoryKB > 0 || spec.MaxProcesses > 0 {
+		args = append(args, "--use_cgroupv2")
+	}
 	if spec.MemoryKB > 0 {
 		args = append(args,
-			"--use_cgroupv2",
 			"--cgroup_mem_max", strconv.Itoa(spec.MemoryKB*1024),
 			// Forbid swap for the cgroup (memory.swap.max = 0). Without this the
 			// limit is soft: when resident memory hits memory.max the kernel spills
@@ -367,6 +371,24 @@ func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
 			// exceeding memory.max triggers the OOM killer immediately.
 			"--cgroup_mem_swap_max", "0",
 		)
+	}
+
+	// Process-count enforcement via a cgroup v2 pids limit. nsjail writes
+	// pids.max = MaxProcesses on the child's cgroup, capping the number of tasks
+	// (processes and threads) the sandbox can have alive at once — the counterpart
+	// to memory.max for the "fork bomb" class of resource exhaustion. Unlike the
+	// memory limit, hitting it does NOT kill the child: once pids.max is reached the
+	// kernel fails the next fork()/clone() with EAGAIN, so the sandboxed program sees
+	// a failed syscall and typically exits non-zero (→ runtime_error) rather than the
+	// SIGKILL/137 an OOM produces. Applied uniformly to every language (keyed only off
+	// spec.MaxProcesses, no per-language branch) and to both the build and run steps —
+	// note that compiled-language build steps fork subprocesses internally (gcc/g++
+	// shell out to cc1/as/ld), so the budgets in configs/languages.yaml (build: 100)
+	// leave ample headroom for normal compilation. Skipped when no limit is set
+	// (MaxProcesses == 0), e.g. the zero-value runner used by the compile-time
+	// assertions.
+	if spec.MaxProcesses > 0 {
+		args = append(args, "--cgroup_pids_max", strconv.Itoa(spec.MaxProcesses))
 	}
 
 	// Seccomp syscall filter, applied UNIFORMLY to every language. The kafel

@@ -17,6 +17,16 @@ type RunSpec struct {
 	// runtimes (the JVM, V8) reserve far in excess of their real footprint, so
 	// an rlimit_as tight enough to matter aborts them before any user code runs.
 	MemoryKB int
+	// MaxProcesses is the maximum number of processes (tasks) the run may have
+	// alive at once. Zero means "no explicit limit". SubprocessRunner ignores
+	// this field; NsjailRunner enforces it as a cgroup v2 pids.max limit via
+	// --cgroup_pids_max. Unlike the memory limit, exceeding it does not kill the
+	// process: the kernel makes fork()/clone() fail with EAGAIN once pids.max is
+	// reached, so the sandboxed program observes a failed syscall (and typically
+	// exits non-zero → runtime_error) rather than being SIGKILLed the way an OOM
+	// is. The count includes every task in the sandbox's cgroup (the run's own
+	// process plus any children/threads it spawns).
+	MaxProcesses int
 }
 
 // RunResult holds what came back from the subprocess.

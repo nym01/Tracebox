@@ -155,14 +155,15 @@ Target: Phase 1's third pillar, the cgroup v2 memory limit applied via nsjail's
 soft spill-to-swap). Each language carries a `memory_kb` budget in
 `configs/languages.yaml`; the runner writes it to the child's `memory.max`, and a
 process whose **resident** footprint exceeds it is OOM-killed (SIGKILL → nsjail
-exit 137 → API `memory_exceeded`). Tests 11-12 hold. **Test 13 surfaces a real
-gap: `max_processes` is never enforced.**
+exit 137 → API `memory_exceeded`). Tests 11-12 hold. **Test 13 originally surfaced
+a real gap — `max_processes` was unenforced — which has since been fixed; it now
+holds, with process count capped via a cgroup v2 `pids.max` limit.**
 
 | # | Test | Attempt | Result | Outcome |
 |---|------|---------|--------|---------|
 | 11 | `TestMemoryBombResidentPy3` / `…Java` | allocate + touch every page until the budget is crossed (py3 100 MiB, java 512 MiB) | OOM-killed mid-allocation: py3 at ~90 MiB, java at ~450 MiB → `memory_exceeded` | **Held (expected)** |
 | 12 | `TestMemoryBombZeroPage` | `mmap.mmap(-1, 1 GiB, MAP_PRIVATE)` then read-only walk (10× py3's budget) | completes `accepted` in ~210 ms — untouched private pages map the shared zero page, never charged to `memory.max` | **Held (documents a boundary)** |
-| 13 | `TestForkBombProcessLimit` | bounded fork bomb, children sleep (linear, self-capped at 2000) | reached **2000 processes with zero resistance** (`CAP_REACHED`); no pids limit fired; service still responsive after | **Did NOT hold — `max_processes` unenforced** |
+| 13 | `TestForkBombProcessLimit` | bounded fork bomb, children sleep (linear, self-capped at 2000) | `fork()` fails with **`EAGAIN` at `created=63`** (1 parent + 63 children = 64 tasks = c's `pids.max`); program exits non-zero → `runtime_error` in ~12–72 ms; service responsive after | **Held (expected) — `max_processes` now enforced** |
 
 ### Notes on individual tests
 
@@ -189,45 +190,61 @@ not untouched allocations. The companion fact (test 11) is that the moment those
 pages are **written** they become resident and the limit fires immediately. The
 only thing that slips through is memory you allocate but never actually use.
 
-**Test 13 — `max_processes` is dead config (a real gap).** Every language in
-`configs/languages.yaml` has a `max_processes` budget (c's run step: 64), and a
-pre-run code audit shows the value is parsed and even validated but **never
-enforced**:
+**Test 13 — `max_processes`, originally dead config, now enforced.** Every language
+in `configs/languages.yaml` has a `max_processes` budget (c's run step: 64). The
+first pass of this suite found that budget was parsed and validated but **never
+enforced**: the value was parsed into `Limits.MaxProcesses`
+(`internal/language/loader.go`) and clamped on a per-request override
+(`internal/api/handlers.go` `effectiveLimits`), but `runner.RunSpec` had **no
+`MaxProcesses` field**, so `handlers.go` silently dropped it, and `buildNsjailArgs`
+(`internal/runner/nsjail.go`) emitted **no `--cgroup_pids_max`**. The original live
+result confirmed the gap: a bounded fork bomb reached 2000 processes and hit its own
+safety cap with zero resistance.
 
-- parsed into `Limits.MaxProcesses` (`internal/language/loader.go`) and clamped on
-  a per-request override (`internal/api/handlers.go` `effectiveLimits`), but
-- `runner.RunSpec` has **no `MaxProcesses` field** — only `WallTimeSec` and
-  `MemoryKB` — so `handlers.go` silently drops the value when constructing the
-  spec, and
-- `buildNsjailArgs` (`internal/runner/nsjail.go`) emits **no `--cgroup_pids_max`
-  and no `--rlimit_nproc`**. The vendored nsjail fully supports `--cgroup_pids_max`
-  (`external/nsjail/cgroup2.cc` writes `pids.max`); the runner simply never passes
-  it.
+**The fix (now in place).** `RunSpec` carries a `MaxProcesses` field, `handlers.go`
+plumbs it from `effectiveLimits` into both the build and run specs, and
+`buildNsjailArgs` emits `--cgroup_pids_max <max_processes>` uniformly — applied to
+every language and to both build and run steps, exactly like the memory limit. The
+vendored nsjail writes the value to the child cgroup's `pids.max`
+(`external/nsjail/cgroup2.cc`), and `--use_cgroupv2` is now emitted whenever *either*
+the memory or the pids limit is set.
 
-The live result confirms the gap with no ambiguity: a bounded fork bomb (only the
-parent forks; children sleep — linear growth, not exponential) **created 2000
-processes and hit its own safety cap with zero resistance**, in under half a second.
-Nothing limited the count: not a pids cgroup, not memory, not the wall clock. A
-real *recursive* fork bomb would be bounded only by host memory / wall time / the
-kernel's `pid_max` — never by the per-language `max_processes`.
+**How the limit surfaces — and why the status is `runtime_error`.** Hitting
+`pids.max` is unlike hitting `memory.max`. The memory limit makes the kernel
+*OOM-kill* the child (SIGKILL → nsjail exit 137 → `memory_exceeded`). The pids limit
+*kills nothing*: once the cgroup reaches `pids.max`, the kernel simply fails the next
+`fork()`/`clone()` with `EAGAIN`. The sandboxed program observes that failed syscall
+and decides what to do; this test's program treats a failed fork as fatal and exits
+non-zero, which the API maps to **`runtime_error`**. There is no dedicated
+`process_limit_exceeded` status, and the runner could not synthesise one — an
+`EAGAIN`-from-`pids.max` is indistinguishable from any other non-zero program exit
+(there is no distinct signal or exit code like OOM's 137 to key off). So
+`runtime_error` is the correct, honest mapping.
 
-What **does** hold is blast-radius containment, not the count limit. The sandbox
-runs in its own PID namespace (Group 1, test 5), so when nsjail exits or hits the
-wall limit it tears the namespace down and every spawned child dies with it — the
-bomb cannot outlive the request or reach host processes. The test confirms this: a
-trivial run immediately afterward returns normally, so the service survived. The
-fix is small and mechanical — add a `MaxProcesses` field to `RunSpec`, plumb it
-from `effectiveLimits`, and emit `--cgroup_pids_max` in `buildNsjailArgs` — but
-until then `max_processes` provides **no** protection, and that is now recorded in
-`docs/security.md`'s known limitations.
+The live result confirms the fix with no ambiguity: the bounded fork bomb's `fork()`
+fails with `errno=11` (`EAGAIN`) at **`created=63`** — 1 parent + 63 children = 64
+tasks = c's `pids.max` of 64 — in ~12–72 ms, far below the 2000 self-cap, and the run
+is reported `runtime_error`. The configured per-language process count, not an
+incidental host limit, is what bounds it.
 
-### New gap found
+Blast-radius containment still holds independently: the sandbox runs in its own PID
+namespace (Group 1, test 5), so even the bounded children die with the namespace when
+nsjail exits. The test confirms a trivial run immediately afterward returns normally,
+so the service survives.
 
-Unlike Groups 1-2 (which held everywhere), Group 3 found one real gap: process-count
-limiting via `max_processes` is configured but unenforced (test 13). It is logged
-loudly in the test output and added to `docs/security.md`. Tests 11-12 held; test 12
-additionally documents that `memory.max` is a resident-only limit and that
-`MAP_SHARED` anonymous pages (unlike `MAP_PRIVATE`) are charged even on read.
+Normal compilation is unaffected: the compiled-language build steps fork internal
+subprocesses (g++/gcc → cc1plus/cc1, as, ld; iverilog → ivlpp/ivl via `system()`),
+but their build budgets (100 for c/cpp/java, 50 for verilog) leave ample headroom —
+all seven languages' hello-world programs still build and run `accepted`.
+
+### The one-time gap, now closed
+
+Group 3 originally found one real gap — process-count limiting via `max_processes`
+was configured but unenforced (test 13) — which has since been fixed (see above): the
+fork bomb is now bounded at the configured count via a cgroup v2 `pids.max` limit, and
+the test asserts that bound. Tests 11-12 held throughout; test 12 additionally
+documents that `memory.max` is a resident-only limit and that `MAP_SHARED` anonymous
+pages (unlike `MAP_PRIVATE`) are charged even on read.
 
 ### Regression
 

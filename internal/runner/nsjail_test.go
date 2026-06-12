@@ -973,6 +973,138 @@ func TestCgroupMemLimitOmittedWhenUnset(t *testing.T) {
 	}
 }
 
+// TestCgroupPidsLimitPassedToNsjail verifies the cgroup v2 process-count limit is
+// wired into the nsjail args from spec.MaxProcesses: --use_cgroupv2 is present,
+// --cgroup_pids_max carries the limit verbatim (a task count, NOT scaled like the
+// memory limit's KB→bytes), and both appear before the "--" separator so they
+// configure nsjail rather than being handed to the sandboxed command.
+func TestCgroupPidsLimitPassedToNsjail(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	const maxProc = 64 // c's run-step budget
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MaxProcesses: maxProc}, 10)
+
+	if !hasFlag(args, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 missing from nsjail args: %v", args)
+	}
+	got, ok := flagValue(args, "--cgroup_pids_max")
+	if !ok {
+		t.Fatalf("--cgroup_pids_max missing from nsjail args: %v", args)
+	}
+	if want := strconv.Itoa(maxProc); got != want {
+		t.Fatalf("--cgroup_pids_max = %q, want %q (a raw task count, not scaled)", got, want)
+	}
+
+	sep := slices.Index(args, "--")
+	if sep < 0 {
+		t.Fatalf("no \"--\" separator in args: %v", args)
+	}
+	if idx := slices.Index(args, "--cgroup_pids_max"); idx > sep {
+		t.Fatalf("--cgroup_pids_max (idx %d) appears after \"--\" (idx %d)", idx, sep)
+	}
+}
+
+// TestCgroupPidsLimitAppliedToEveryLanguage confirms the process-count limit is
+// uniform: every language's command variant (build and run steps alike) gets
+// --cgroup_pids_max when its spec carries a MaxProcesses, with no per-language
+// exemption (mirrors the seccomp and memory uniformity tests). This matters because
+// compiled-language BUILD steps fork internally (g++/gcc → cc1/as/ld), so the limit
+// must be present on them too, sized to leave headroom (build budgets are 100).
+func TestCgroupPidsLimitAppliedToEveryLanguage(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	commands := map[string]string{
+		"py3":           pythonInterpreter,
+		"bash":          bashInterpreter,
+		"js":            nodeInterpreter,
+		"cpp build":     cppCompiler,
+		"c build":       cCompiler,
+		"compiled run":  "./solution",
+		"java build":    javacCompiler,
+		"java run":      javaRuntime,
+		"verilog build": iverilogCompiler,
+		"verilog run":   vvpRuntime,
+	}
+	for name, cmd := range commands {
+		t.Run(name, func(t *testing.T) {
+			args := r.buildNsjailArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/work", MaxProcesses: 100}, 10)
+			got, ok := flagValue(args, "--cgroup_pids_max")
+			if !ok {
+				t.Fatalf("%s: --cgroup_pids_max missing: %v", cmd, args)
+			}
+			if want := strconv.Itoa(100); got != want {
+				t.Fatalf("%s: --cgroup_pids_max = %q, want %q", cmd, got, want)
+			}
+		})
+	}
+}
+
+// TestCgroupPidsLimitOmittedWhenUnset confirms that with no process-count limit set
+// (MaxProcesses == 0) no --cgroup_pids_max flag is emitted, and — when the memory
+// limit is also unset — no cgroup backend is requested at all.
+func TestCgroupPidsLimitOmittedWhenUnset(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	// Memory limit only, no process limit: --cgroup_pids_max must be absent, but the
+	// cgroup backend is still on for the memory limit.
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: 65536}, 10)
+	if hasFlag(args, "--cgroup_pids_max") {
+		t.Fatalf("expected no --cgroup_pids_max when MaxProcesses is 0, got: %v", args)
+	}
+	if !hasFlag(args, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 should still be present for the memory limit: %v", args)
+	}
+
+	// Neither limit set: no cgroup flags at all.
+	none := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work"}, 10)
+	if hasFlag(none, "--use_cgroupv2") || hasFlag(none, "--cgroup_pids_max") {
+		t.Fatalf("expected no cgroup flags when neither limit is set, got: %v", none)
+	}
+}
+
+// TestCgroupUseCgroupv2EmittedOnce verifies the shared --use_cgroupv2 flag is
+// emitted exactly once regardless of which cgroup limits are in force: it must
+// appear when only the pids limit is set (the memory branch no longer owns it), and
+// must NOT be duplicated when both limits are set (nsjail needs it only once).
+func TestCgroupUseCgroupv2EmittedOnce(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	// Pids limit only — the flag must still be present (it is no longer tied to the
+	// memory branch).
+	pidsOnly := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MaxProcesses: 64}, 10)
+	if !hasFlag(pidsOnly, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 missing when only MaxProcesses is set: %v", pidsOnly)
+	}
+
+	// Both limits — the flag must appear exactly once.
+	both := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: 65536, MaxProcesses: 64}, 10)
+	count := 0
+	for _, a := range both {
+		if a == "--use_cgroupv2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("--use_cgroupv2 should appear exactly once, got %d: %v", count, both)
+	}
+}
+
 // TestParseIncludeDirs checks the header-search block is extracted from
 // `g++ -E -v` output and surrounding noise is ignored.
 func TestParseIncludeDirs(t *testing.T) {

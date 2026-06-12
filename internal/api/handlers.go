@@ -142,11 +142,12 @@ func run(w http.ResponseWriter, r *http.Request) {
 		}
 
 		bres, buildErr := rr.Run(r.Context(), runner.RunSpec{
-			Cmd:         buildCmd,
-			Args:        buildArgs,
-			WorkDir:     tmpDir,
-			WallTimeSec: wallSec,
-			MemoryKB:    buildLimits.MemoryKB,
+			Cmd:          buildCmd,
+			Args:         buildArgs,
+			WorkDir:      tmpDir,
+			WallTimeSec:  wallSec,
+			MemoryKB:     buildLimits.MemoryKB,
+			MaxProcesses: buildLimits.MaxProcesses,
 		})
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
@@ -192,12 +193,13 @@ func run(w http.ResponseWriter, r *http.Request) {
 		}
 
 		result, runErr := rr.Run(r.Context(), runner.RunSpec{
-			Cmd:         cmd,
-			Args:        args,
-			Stdin:       tc.Stdin,
-			WorkDir:     tmpDir,
-			WallTimeSec: wallSec,
-			MemoryKB:    runLimits.MemoryKB,
+			Cmd:          cmd,
+			Args:         args,
+			Stdin:        tc.Stdin,
+			WorkDir:      tmpDir,
+			WallTimeSec:  wallSec,
+			MemoryKB:     runLimits.MemoryKB,
+			MaxProcesses: runLimits.MaxProcesses,
 		})
 		if runErr != nil {
 			testResults[i] = TestResult{Status: status.InternalError}
