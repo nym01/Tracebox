@@ -28,18 +28,25 @@ type resolverFn func(context.Context) ([]string, error)
 // about while the others stay out of the way (and, in particular, never shell out
 // to ldd on a host that lacks the interpreter).
 //
-// The three compiled-language resolvers (cpp build, c build, cpp/c run) are always
-// stubbed to no-ops here so NewNsjailRunner never shells out to gcc/g++ during a
-// unit test. A test that exercises those profiles assigns resolveCppBuildMounts /
-// resolveCBuildMounts / resolveCppRunMounts directly after calling this helper; the
-// originals are still restored on cleanup.
+// The compiled-language resolvers (cpp build, c build, cpp/c run, java build, java
+// run, verilog build, verilog run) are always stubbed to no-ops here so
+// NewNsjailRunner never shells out to gcc/g++/ldd or inspects the JDK or Icarus
+// install during a unit test. A test that exercises those profiles assigns
+// resolveCppBuildMounts / resolveCBuildMounts / resolveCppRunMounts /
+// resolveJavaBuildMounts / resolveJavaRunMounts / resolveVerilogBuildMounts /
+// resolveVerilogRunMounts directly after calling this helper; the originals are
+// still restored on cleanup.
 func withStubbedResolvers(t *testing.T, py3, bash, js resolverFn) {
 	t.Helper()
 	origPy3, origBash, origJs := resolvePy3Mounts, resolveBashMounts, resolveJsMounts
 	origCppBuild, origCBuild, origCppRun := resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts
+	origJavaBuild, origJavaRun := resolveJavaBuildMounts, resolveJavaRunMounts
+	origVerilogBuild, origVerilogRun := resolveVerilogBuildMounts, resolveVerilogRunMounts
 	t.Cleanup(func() {
 		resolvePy3Mounts, resolveBashMounts, resolveJsMounts = origPy3, origBash, origJs
 		resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = origCppBuild, origCBuild, origCppRun
+		resolveJavaBuildMounts, resolveJavaRunMounts = origJavaBuild, origJavaRun
+		resolveVerilogBuildMounts, resolveVerilogRunMounts = origVerilogBuild, origVerilogRun
 	})
 	noop := func(context.Context) ([]string, error) { return nil, nil }
 	if py3 == nil {
@@ -53,6 +60,8 @@ func withStubbedResolvers(t *testing.T, py3, bash, js resolverFn) {
 	}
 	resolvePy3Mounts, resolveBashMounts, resolveJsMounts = py3, bash, js
 	resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = noop, noop, noop
+	resolveJavaBuildMounts, resolveJavaRunMounts = noop, noop
+	resolveVerilogBuildMounts, resolveVerilogRunMounts = noop, noop
 }
 
 // assertMountsResolvedOnceAndReused verifies that the expensive mount resolution
@@ -198,11 +207,12 @@ func TestNewNsjailRunnerFailsLoudlyOnResolveError(t *testing.T) {
 	}
 }
 
-// TestFilesystemArgsCompiledLanguageUnchanged confirms the languages that are
-// still on the shared filesystem get --disable_clone_newns and are unaffected by
-// the isolated-profile caches. g++, gcc and "./artifact" are deliberately
-// excluded: the cpp/c build steps and any "./artifact" run step are now isolated.
-func TestFilesystemArgsCompiledLanguageUnchanged(t *testing.T) {
+// TestFilesystemArgsUnknownCommandFallsBack confirms the --disable_clone_newns
+// fallback still applies to a genuinely unknown command — one that matches none of
+// the seven language profiles. Every real language (py3, bash, js, g++, gcc, javac,
+// java, iverilog, vvp and "./solution") now has its own isolated profile, so this
+// default branch is only a safety net for an unrecognised command.
+func TestFilesystemArgsUnknownCommandFallsBack(t *testing.T) {
 	withStubbedResolvers(t, nil, nil, nil)
 
 	r, err := NewNsjailRunner(context.Background(), "nsjail")
@@ -210,10 +220,7 @@ func TestFilesystemArgsCompiledLanguageUnchanged(t *testing.T) {
 		t.Fatalf("NewNsjailRunner: %v", err)
 	}
 
-	// A representative sample of the still-shared commands: the Java
-	// compiler/runtime and the Verilog build/run binaries. Note g++, gcc and
-	// "./solution" are NOT here — they have their own profiles now.
-	for _, cmd := range []string{"/usr/bin/javac", "/usr/bin/java", "/usr/bin/iverilog", "/usr/bin/vvp"} {
+	for _, cmd := range []string{"/usr/bin/some-unknown-tool", "/bin/cat"} {
 		got := r.filesystemArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/x"})
 		want := []string{"--disable_clone_newns"}
 		if !reflect.DeepEqual(got, want) {
@@ -419,6 +426,276 @@ func TestNewNsjailRunnerFailsLoudlyOnCResolveError(t *testing.T) {
 	}
 }
 
+// TestJavaBuildArgs verifies the javac build step gets its cached build mounts, a
+// writable tmpfs /tmp (javac runs on the JVM, which writes perf-data scratch under
+// /tmp), and the per-request work directory mounted writable — in that order.
+func TestJavaBuildArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	buildCache := []string{
+		"--bindmount_ro", "/usr/lib/jvm/java-17-openjdk-amd64",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--symlink", "/usr/lib/jvm/java-17-openjdk-amd64/bin/javac:/usr/bin/javac",
+	}
+	resolveJavaBuildMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), buildCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: javacCompiler, WorkDir: "/tmp/build"})
+	want := append(append([]string(nil), buildCache...),
+		"--tmpfsmount", "/tmp",
+		"--bindmount", "/tmp/build",
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("java build filesystemArgs = %v, want %v", got, want)
+	}
+}
+
+// TestJavaRunArgs verifies the java run step gets its cached mounts plus the
+// writable work directory, and crucially NO tmpfs /tmp (the security-critical run
+// step gets nothing it does not need; the JVM degrades gracefully without it).
+func TestJavaRunArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	runCache := []string{
+		"--bindmount_ro", "/usr/lib/jvm/java-17-openjdk-amd64",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--symlink", "/usr/lib/jvm/java-17-openjdk-amd64/bin/java:/usr/bin/java",
+	}
+	resolveJavaRunMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: javaRuntime, WorkDir: "/tmp/run"})
+	want := append(append([]string(nil), runCache...), "--bindmount", "/tmp/run")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("java run filesystemArgs = %v, want %v", got, want)
+	}
+	for _, a := range got {
+		if a == "--tmpfsmount" {
+			t.Fatalf("java run step must not mount a tmpfs /tmp: %v", got)
+		}
+	}
+}
+
+// TestJavaMountsResolvedOnceAndReused confirms the two java profiles (which inspect
+// the JDK on the host) are resolved exactly once, at construction, and reused
+// across requests with only the per-request work dir (and, for the build step,
+// the tmpfs /tmp) appended. Mirrors TestCppMountsResolvedOnceAndReused.
+func TestJavaMountsResolvedOnceAndReused(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+
+	var buildCalls, runCalls int
+	buildCache := []string{"--bindmount_ro", "/usr/lib/jvm/java-17-openjdk-amd64", "--symlink", "/jdk/bin/javac:/usr/bin/javac"}
+	runCache := []string{"--bindmount_ro", "/usr/lib/jvm/java-17-openjdk-amd64", "--symlink", "/jdk/bin/java:/usr/bin/java"}
+	resolveJavaBuildMounts = func(context.Context) ([]string, error) {
+		buildCalls++
+		return append([]string(nil), buildCache...), nil
+	}
+	resolveJavaRunMounts = func(context.Context) ([]string, error) {
+		runCalls++
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("expected each java resolver to run once at construction, got build=%d run=%d", buildCalls, runCalls)
+	}
+
+	for i := range 5 {
+		workDir := fmt.Sprintf("/tmp/goboxd-%d", i)
+
+		gotBuild := r.filesystemArgs(RunSpec{Cmd: javacCompiler, WorkDir: workDir})
+		wantBuild := append(append([]string(nil), buildCache...), "--tmpfsmount", "/tmp", "--bindmount", workDir)
+		if !reflect.DeepEqual(gotBuild, wantBuild) {
+			t.Fatalf("build request %d: filesystemArgs = %v, want %v", i, gotBuild, wantBuild)
+		}
+
+		gotRun := r.filesystemArgs(RunSpec{Cmd: javaRuntime, WorkDir: workDir})
+		wantRun := append(append([]string(nil), runCache...), "--bindmount", workDir)
+		if !reflect.DeepEqual(gotRun, wantRun) {
+			t.Fatalf("run request %d: filesystemArgs = %v, want %v", i, gotRun, wantRun)
+		}
+	}
+
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("java resolver re-ran on later requests: build=%d run=%d", buildCalls, runCalls)
+	}
+	if !reflect.DeepEqual(r.javaBuildMounts, buildCache) {
+		t.Fatalf("java build cache mutated: got %v, want %v", r.javaBuildMounts, buildCache)
+	}
+	if !reflect.DeepEqual(r.javaRunMounts, runCache) {
+		t.Fatalf("java run cache mutated: got %v, want %v", r.javaRunMounts, runCache)
+	}
+}
+
+// TestNewNsjailRunnerFailsLoudlyOnJavaResolveError confirms a java resolution
+// failure at startup surfaces as a construction error, for both java profiles.
+func TestNewNsjailRunnerFailsLoudlyOnJavaResolveError(t *testing.T) {
+	fail := func(context.Context) ([]string, error) { return nil, fmt.Errorf("jdk not found") }
+
+	t.Run("build", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveJavaBuildMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when java build mounts cannot be resolved")
+		}
+	})
+	t.Run("run", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveJavaRunMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when java run mounts cannot be resolved")
+		}
+	})
+}
+
+// TestVerilogBuildArgs verifies the iverilog build step gets its cached build
+// mounts, a writable tmpfs /tmp (iverilog writes its intermediate command file
+// there), and the per-request work directory mounted writable — in that order.
+func TestVerilogBuildArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	buildCache := []string{
+		"--bindmount_ro", "/usr/lib/ivl",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--bindmount_ro", "/usr/bin/iverilog:/usr/bin/iverilog",
+	}
+	resolveVerilogBuildMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), buildCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: iverilogCompiler, WorkDir: "/tmp/build"})
+	want := append(append([]string(nil), buildCache...),
+		"--tmpfsmount", "/tmp",
+		"--bindmount", "/tmp/build",
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("verilog build filesystemArgs = %v, want %v", got, want)
+	}
+}
+
+// TestVerilogRunArgs verifies the vvp run step gets its cached mounts plus the
+// writable work directory, and crucially NO tmpfs /tmp (the security-critical run
+// step gets nothing it does not need).
+func TestVerilogRunArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	runCache := []string{
+		"--bindmount_ro", "/usr/lib/ivl",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--bindmount_ro", "/usr/bin/vvp:/usr/bin/vvp",
+	}
+	resolveVerilogRunMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: vvpRuntime, WorkDir: "/tmp/run"})
+	want := append(append([]string(nil), runCache...), "--bindmount", "/tmp/run")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("verilog run filesystemArgs = %v, want %v", got, want)
+	}
+	for _, a := range got {
+		if a == "--tmpfsmount" {
+			t.Fatalf("verilog run step must not mount a tmpfs /tmp: %v", got)
+		}
+	}
+}
+
+// TestVerilogMountsResolvedOnceAndReused confirms the two verilog profiles (which
+// inspect the Icarus install on the host) are resolved exactly once, at
+// construction, and reused across requests with only the per-request work dir (and,
+// for the build step, the tmpfs /tmp) appended. Mirrors the java/cpp cases.
+func TestVerilogMountsResolvedOnceAndReused(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+
+	var buildCalls, runCalls int
+	buildCache := []string{"--bindmount_ro", "/usr/lib/ivl", "--bindmount_ro", "/usr/bin/iverilog:/usr/bin/iverilog"}
+	runCache := []string{"--bindmount_ro", "/usr/lib/ivl", "--bindmount_ro", "/usr/bin/vvp:/usr/bin/vvp"}
+	resolveVerilogBuildMounts = func(context.Context) ([]string, error) {
+		buildCalls++
+		return append([]string(nil), buildCache...), nil
+	}
+	resolveVerilogRunMounts = func(context.Context) ([]string, error) {
+		runCalls++
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("expected each verilog resolver to run once at construction, got build=%d run=%d", buildCalls, runCalls)
+	}
+
+	for i := range 5 {
+		workDir := fmt.Sprintf("/tmp/goboxd-%d", i)
+
+		gotBuild := r.filesystemArgs(RunSpec{Cmd: iverilogCompiler, WorkDir: workDir})
+		wantBuild := append(append([]string(nil), buildCache...), "--tmpfsmount", "/tmp", "--bindmount", workDir)
+		if !reflect.DeepEqual(gotBuild, wantBuild) {
+			t.Fatalf("build request %d: filesystemArgs = %v, want %v", i, gotBuild, wantBuild)
+		}
+
+		gotRun := r.filesystemArgs(RunSpec{Cmd: vvpRuntime, WorkDir: workDir})
+		wantRun := append(append([]string(nil), runCache...), "--bindmount", workDir)
+		if !reflect.DeepEqual(gotRun, wantRun) {
+			t.Fatalf("run request %d: filesystemArgs = %v, want %v", i, gotRun, wantRun)
+		}
+	}
+
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("verilog resolver re-ran on later requests: build=%d run=%d", buildCalls, runCalls)
+	}
+	if !reflect.DeepEqual(r.verilogBuildMounts, buildCache) {
+		t.Fatalf("verilog build cache mutated: got %v, want %v", r.verilogBuildMounts, buildCache)
+	}
+	if !reflect.DeepEqual(r.verilogRunMounts, runCache) {
+		t.Fatalf("verilog run cache mutated: got %v, want %v", r.verilogRunMounts, runCache)
+	}
+}
+
+// TestNewNsjailRunnerFailsLoudlyOnVerilogResolveError confirms a verilog resolution
+// failure at startup surfaces as a construction error, for both verilog profiles.
+func TestNewNsjailRunnerFailsLoudlyOnVerilogResolveError(t *testing.T) {
+	fail := func(context.Context) ([]string, error) { return nil, fmt.Errorf("icarus not found") }
+
+	t.Run("build", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveVerilogBuildMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when verilog build mounts cannot be resolved")
+		}
+	})
+	t.Run("run", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveVerilogRunMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when verilog run mounts cannot be resolved")
+		}
+	})
+}
+
 // TestParseIncludeDirs checks the header-search block is extracted from
 // `g++ -E -v` output and surrounding noise is ignored.
 func TestParseIncludeDirs(t *testing.T) {
@@ -464,6 +741,87 @@ libraries: =/usr/lib/gcc/x86_64-linux-gnu/12/:/usr/lib/gcc/x86_64-linux-gnu/12/.
 	}
 	if !reflect.DeepEqual(libDirs, want) {
 		t.Fatalf("parseSearchDirs libDirs = %v, want %v", libDirs, want)
+	}
+}
+
+// TestIsIverilogBaseDir checks the content-based validation of an Icarus base
+// directory: a dir with the ivl binary qualifies, a dir with only a .conf/.sft
+// control file qualifies, and an unrelated dir (or a non-directory) does not.
+func TestIsIverilogBaseDir(t *testing.T) {
+	root := t.TempDir()
+	mk := func(p string, isDir bool) string {
+		full := filepath.Join(root, p)
+		if isDir {
+			if err := os.MkdirAll(full, 0755); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return full
+	}
+
+	withIvl := mk("ivldir", true)
+	mk("ivldir/ivl", false)
+	withConf := mk("confdir", true)
+	mk("confdir/vvp.conf", false)
+	empty := mk("emptydir", true)
+	notDir := mk("afile", false)
+
+	cases := []struct {
+		name string
+		dir  string
+		want bool
+	}{
+		{"has ivl binary", withIvl, true},
+		{"has conf file", withConf, true},
+		{"empty dir", empty, false},
+		{"not a directory", notDir, false},
+		{"missing", filepath.Join(root, "nope"), false},
+	}
+	for _, c := range cases {
+		if got := isIverilogBaseDir(c.dir); got != c.want {
+			t.Errorf("%s: isIverilogBaseDir(%q) = %v, want %v", c.name, c.dir, got, c.want)
+		}
+	}
+}
+
+// TestIverilogModuleFiles checks that the ivl/ivlpp helper executables and the
+// *.tgt / *.vpi modules are collected from the base directories, that a missing
+// helper is simply omitted, and that plain config files are not returned.
+func TestIverilogModuleFiles(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "ivl")
+	if err := os.MkdirAll(base, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string) string {
+		p := filepath.Join(base, name)
+		if err := os.WriteFile(p, []byte("x"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ivl := mk("ivl")
+	vvpTgt := mk("vvp.tgt")
+	systemVpi := mk("system.vpi")
+	mk("vvp.conf") // config file: must NOT be returned
+	// ivlpp and vhdlpp deliberately absent: they should just be skipped, not error.
+
+	got := iverilogModuleFiles([]string{base})
+	want := map[string]bool{ivl: true, vvpTgt: true, systemVpi: true}
+	if len(got) != len(want) {
+		t.Fatalf("iverilogModuleFiles = %v, want the 3 module files %v", got, want)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Fatalf("iverilogModuleFiles returned unexpected %q (got %v)", p, got)
+		}
 	}
 }
 

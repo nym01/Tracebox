@@ -23,14 +23,21 @@ const nsjailGraceSec = 5
 // bind-mounted read-only. cpp and c each add a compiler build-step profile (g++
 // and gcc respectively); their compiled-artifact run steps share a single profile
 // (see filesystemArgs), because a C binary's library needs are a subset of a
-// C++ binary's. The remaining compiled languages (java, verilog) still share the
-// host filesystem via --disable_clone_newns until they get their own profiles.
+// C++ binary's. java adds two more profiles (javac build, java run), both of which
+// mount the whole JDK runtime image — see resolveJavaMounts. verilog adds the last
+// two (iverilog build, vvp run), both of which mount the Icarus "ivl base
+// directory" — see resolveVerilogMounts. With verilog migrated, no language is left
+// on --disable_clone_newns; that branch now only catches genuinely unknown commands.
 const (
 	pythonInterpreter = "/usr/bin/python3"
 	bashInterpreter   = "/usr/bin/bash"
 	nodeInterpreter   = "/usr/bin/node"
 	cppCompiler       = "/usr/bin/g++"
 	cCompiler         = "/usr/bin/gcc"
+	javacCompiler     = "/usr/bin/javac"
+	javaRuntime       = "/usr/bin/java"
+	iverilogCompiler  = "/usr/bin/iverilog"
+	vvpRuntime        = "/usr/bin/vvp"
 )
 
 // artifactRunPrefix is how the language registry invokes a compiled artifact: as
@@ -51,9 +58,10 @@ const artifactRunPrefix = "./"
 // compiler build-step profile (the g++/gcc driver, the toolchain programs it
 // shells out to, its header and library search paths), and they share a single
 // compiled-artifact run profile for executing the resulting binary — see
-// filesystemArgs for why the build and run profiles differ. The remaining
-// compiled languages (java, verilog) still use --disable_clone_newns and share
-// the host filesystem until they get their own mount profiles.
+// filesystemArgs for why the build and run profiles differ. java and verilog each
+// add a build profile and a run profile of their own. With all seven languages
+// migrated, no language uses --disable_clone_newns any more; every request runs in
+// its own mount namespace with a minimal read-only root.
 //
 // Each profile's read-only mount list is the same for every request, so it is
 // resolved once at startup (via NewNsjailRunner) and cached rather than shelling
@@ -84,6 +92,27 @@ type NsjailRunner struct {
 	cppBuildMounts []string
 	cBuildMounts   []string
 	cppRunMounts   []string
+
+	// javaBuildMounts holds the read-only mounts for the javac build step and
+	// javaRunMounts those for the java run step. Both mount the whole JDK runtime
+	// image (its bin/, lib/ and lib/modules under JAVA_HOME) read-only and recreate
+	// the /usr/bin/javac or /usr/bin/java symlink inside the sandbox — see
+	// resolveJavaMounts for why a symlink rather than a bind mount. Unlike cpp/c,
+	// java's run step is not a per-request compiled binary; it is the same java
+	// launcher every request, so its mounts are static and cached at startup too.
+	javaBuildMounts []string
+	javaRunMounts   []string
+
+	// verilogBuildMounts holds the read-only mounts for the iverilog build step and
+	// verilogRunMounts those for the vvp run step. Both mount the Icarus "ivl base
+	// directory" (which holds the programs iverilog shells out to — ivl, ivlpp — and
+	// the VPI modules / config vvp loads) read-only, plus the launcher binary and the
+	// shared libraries the launcher and those helpers need — see resolveVerilogMounts.
+	// Like java, verilog's run step is the same vvp launcher every request (the
+	// per-request content is the .vvp artifact in the work dir), so both are static
+	// and cached at startup.
+	verilogBuildMounts []string
+	verilogRunMounts   []string
 }
 
 // NewNsjailRunner constructs an NsjailRunner with its per-language filesystem
@@ -119,14 +148,34 @@ func NewNsjailRunner(ctx context.Context, nsjailPath string) (NsjailRunner, erro
 	if err != nil {
 		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve cpp run mounts: %w", err)
 	}
+	javaBuild, err := resolveJavaBuildMounts(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve java build mounts: %w", err)
+	}
+	javaRun, err := resolveJavaRunMounts(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve java run mounts: %w", err)
+	}
+	verilogBuild, err := resolveVerilogBuildMounts(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve verilog build mounts: %w", err)
+	}
+	verilogRun, err := resolveVerilogRunMounts(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve verilog run mounts: %w", err)
+	}
 	return NsjailRunner{
-		NsjailPath:     nsjailPath,
-		py3Mounts:      py3,
-		bashMounts:     bash,
-		jsMounts:       js,
-		cppBuildMounts: cppBuild,
-		cBuildMounts:   cBuild,
-		cppRunMounts:   cppRun,
+		NsjailPath:         nsjailPath,
+		py3Mounts:          py3,
+		bashMounts:         bash,
+		jsMounts:           js,
+		cppBuildMounts:     cppBuild,
+		cBuildMounts:       cBuild,
+		cppRunMounts:       cppRun,
+		javaBuildMounts:    javaBuild,
+		javaRunMounts:      javaRun,
+		verilogBuildMounts: verilogBuild,
+		verilogRunMounts:   verilogRun,
 	}, nil
 }
 
@@ -242,7 +291,7 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 // writable. The host root filesystem is never visible, so paths like /etc/passwd
 // simply do not exist inside the sandbox.
 //
-// There are five profiles:
+// There are seven profiles:
 //   - py3, bash, js: the interpreter binary, its shared libraries, and any
 //     language-specific read-only paths.
 //   - the cpp / c build step (Cmd == g++ / gcc): the compiler toolchain — driver,
@@ -259,15 +308,30 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 //     of a C++ one's. This is the security-critical profile — it runs the
 //     untrusted *binary* — so it is kept as tight as possible: individual .so
 //     files, no directories.
+//   - the java build step (Cmd == javac) and java run step (Cmd == java): both
+//     mount the whole JDK runtime image (JAVA_HOME's bin/, lib/ and lib/modules)
+//     read-only and recreate the launcher symlink. Unlike cpp/c, java's run step
+//     is not a per-request binary but the same java launcher every time, so it too
+//     is static and cached. javac gets a writable tmpfs /tmp for the JVM's perf
+//     scratch; the java run step does not (the JVM degrades gracefully without it).
+//     See resolveJavaMounts for why both need the full runtime image and a symlink.
+//   - the verilog build step (Cmd == iverilog) and verilog run step (Cmd == vvp):
+//     both mount the Icarus "ivl base directory" read-only — it holds the programs
+//     iverilog shells out to (ivl, ivlpp) and the VPI modules / config vvp loads —
+//     plus the launcher binary and the shared libraries the launcher and those
+//     helpers need. Like java, vvp's run step is the same launcher every request
+//     (the per-request content is the .vvp artifact in the work dir), so both are
+//     static and cached. iverilog gets a writable tmpfs /tmp for its driver's
+//     intermediate command file; the vvp run step does not. See resolveVerilogMounts.
 //
 // Each profile's read-only mounts are identical for every request, so they are
 // taken from the cache that NewNsjailRunner resolved once at startup. Only the
 // writable work directory varies per request and is appended here.
 //
-// Every other command still gets --disable_clone_newns, which keeps the mount
-// namespace disabled so the child shares the host filesystem (and finds its
-// compiler/interpreter and WorkDir) exactly as before. Those languages will each
-// get their own minimal mount profile in later steps.
+// With all seven languages migrated, the --disable_clone_newns fallback in the
+// default branch is no longer reached by any known language; it remains only as a
+// safe default for a genuinely unknown command (one not in any profile), which then
+// shares the host filesystem exactly as before rather than failing outright.
 func (r NsjailRunner) filesystemArgs(spec RunSpec) []string {
 	switch {
 	case spec.Cmd == pythonInterpreter:
@@ -282,6 +346,24 @@ func (r NsjailRunner) filesystemArgs(spec RunSpec) []string {
 	case spec.Cmd == cCompiler:
 		// Build step: needs a writable /tmp for gcc's intermediate files.
 		return r.isolatedArgs(r.cBuildMounts, spec, true)
+	case spec.Cmd == javacCompiler:
+		// Build step: javac runs on the JVM, which writes its perf-data scratch
+		// (/tmp/hsperfdata_*) under /tmp, so give it a writable tmpfs /tmp.
+		return r.isolatedArgs(r.javaBuildMounts, spec, true)
+	case spec.Cmd == javaRuntime:
+		// Run step: the same java launcher every request. The JVM also wants
+		// /tmp/hsperfdata_* but degrades gracefully without it, so the
+		// security-critical run step gets no /tmp.
+		return r.isolatedArgs(r.javaRunMounts, spec, false)
+	case spec.Cmd == iverilogCompiler:
+		// Build step: iverilog's driver writes its intermediate command file (and
+		// ivl/ivlpp their scratch) under /tmp, so give it a writable tmpfs /tmp.
+		return r.isolatedArgs(r.verilogBuildMounts, spec, true)
+	case spec.Cmd == vvpRuntime:
+		// Run step: the same vvp launcher every request (the per-request content is
+		// the .vvp artifact in the work dir). The security-critical run step gets no
+		// /tmp — vvp does not need scratch space for our programs.
+		return r.isolatedArgs(r.verilogRunMounts, spec, false)
 	case strings.HasPrefix(spec.Cmd, artifactRunPrefix):
 		// Run step: executing the compiled binary in the work directory.
 		return r.isolatedArgs(r.cppRunMounts, spec, false)
@@ -528,6 +610,315 @@ var resolveCppRunMounts = func(ctx context.Context) ([]string, error) {
 		m.addFileRO(lib)
 	}
 	return m.args(), nil
+}
+
+// --- java: build-step and run-step mount resolution --------------------------
+
+// resolveJavaBuildMounts and resolveJavaRunMounts build the read-only mount lists
+// for the javac build step and the java run step. Both are thin wrappers over
+// resolveJavaMounts (the two launchers live in the same JDK and need the same
+// runtime image; they differ only in which launcher symlink is recreated), and
+// both are package vars so tests can substitute a fake (the real ones inspect the
+// JDK on the host).
+var resolveJavaBuildMounts = func(ctx context.Context) ([]string, error) {
+	return resolveJavaMounts(ctx, javacCompiler)
+}
+
+var resolveJavaRunMounts = func(ctx context.Context) ([]string, error) {
+	return resolveJavaMounts(ctx, javaRuntime)
+}
+
+// resolveJavaMounts builds the read-only mount list for a JDK launcher (javac or
+// java). Unlike an interpreter, a JDK launcher cannot run from just its binary
+// plus shared libraries: it loads the runtime image (lib/modules), libjvm.so and
+// the rest of the JDK's own libraries from JAVA_HOME at startup. So this profile
+// mounts the entire JAVA_HOME directory tree read-only at its literal path — bin/,
+// lib/, lib/modules, conf/ and everything else — which is broad but, like the
+// compiler build profile, acceptable: the JDK is trusted, only the source/.class
+// is untrusted, and the tree is read-only with no network in the jail.
+//
+// The crucial subtlety is the launcher symlink. The launcher derives JAVA_HOME by
+// reading /proc/self/exe and stripping the trailing bin/<launcher>. If we bind-
+// mounted the real launcher onto /usr/bin/java, /proc/self/exe would report
+// /usr/bin/java and the JVM would mis-derive JAVA_HOME as /usr, then fail to find
+// /usr/lib/modules ("Error occurred during initialization of VM"). Instead we
+// recreate the original symlink (/usr/bin/java -> JAVA_HOME/bin/java) inside the
+// sandbox with nsjail's --symlink, so execve resolves through it to the real path
+// under the mounted JAVA_HOME and the derivation lands on the right home.
+func resolveJavaMounts(ctx context.Context, launcher string) ([]string, error) {
+	// The launcher path (/usr/bin/javac, /usr/bin/java) is a chain of symlinks
+	// (Debian's update-alternatives) ending at JAVA_HOME/bin/<launcher>. Resolve it
+	// so we can both mount JAVA_HOME and point the recreated symlink at the real
+	// binary.
+	realLauncher, err := filepath.EvalSymlinks(launcher)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", launcher, err)
+	}
+
+	// JAVA_HOME is two levels up from the launcher (.../bin/<launcher>). Mount the
+	// whole tree read-only; it carries lib/modules, lib/server/libjvm.so and the
+	// rest of the runtime image the launcher loads at startup.
+	javaHome := filepath.Dir(filepath.Dir(realLauncher))
+	m := newMountSet()
+	m.addDirRO(javaHome)
+	if len(m.dirs) == 0 {
+		return nil, fmt.Errorf("java mounts: JAVA_HOME %q is not a directory", javaHome)
+	}
+
+	// Debian's OpenJDK splits the editable config (java.security, logging.properties,
+	// …) out into /etc/java-<ver>-openjdk and symlinks JAVA_HOME/conf/** at it. Those
+	// symlinks are inside the mounted JAVA_HOME but their targets are not, so without
+	// this the JVM aborts at startup ("Error loading java.security file"). Mount the
+	// /etc config tree read-only too. Globbed (not hardcoded) so a version bump still
+	// resolves; absent on a non-Debian JDK, which simply needs no extra mount.
+	for _, d := range javaEtcConfigDirs() {
+		m.addDirRO(d)
+	}
+
+	// The system shared libraries the launcher links against (libc, libz, …) and
+	// the dynamic loader. The JDK's own libraries (libjli, …) live under JAVA_HOME
+	// and are already covered by the directory mount, so addFileRO drops them.
+	libs, err := sharedLibraries(ctx, realLauncher)
+	if err != nil {
+		return nil, fmt.Errorf("java mounts: %w", err)
+	}
+	// libjvm.so is dlopen'd by the launcher at startup, so ldd of the launcher does
+	// not reveal libjvm.so's own dependencies — notably libstdc++, libgcc_s and
+	// libm, which live in the system lib dir, not under JAVA_HOME. ldd libjvm.so
+	// too and fold in everything it needs, or the JVM aborts before any user code
+	// ("dl failure ... libstdc++.so.6: cannot open shared object file").
+	for _, jvm := range jvmLibraries(javaHome) {
+		jvmLibs, err := sharedLibraries(ctx, jvm)
+		if err != nil {
+			return nil, fmt.Errorf("java mounts: %w", err)
+		}
+		libs = append(libs, jvmLibs...)
+	}
+	for _, lib := range libs {
+		m.addFileRO(lib)
+	}
+
+	args := m.args()
+	// Recreate the launcher symlink inside the sandbox (see the doc comment for why
+	// a symlink and not a bind mount). Format is target:linkpath.
+	args = append(args, "--symlink", realLauncher+":"+launcher)
+	return args, nil
+}
+
+// jvmLibraries returns the libjvm.so files under JAVA_HOME (normally just the
+// server VM's lib/server/libjvm.so) so the caller can ldd them for the system
+// libraries they pull in but the launcher's own ldd does not (libjvm.so is
+// dlopen'd at runtime). It globs rather than hardcoding lib/server so an image
+// shipping the VM elsewhere (e.g. lib/client) still resolves.
+func jvmLibraries(javaHome string) []string {
+	matches, _ := filepath.Glob(filepath.Join(javaHome, "lib", "*", "libjvm.so"))
+	return matches
+}
+
+// javaEtcConfigDirs returns the Debian OpenJDK /etc config directories
+// (e.g. /etc/java-17-openjdk) that JAVA_HOME/conf symlinks point at. Globbed so a
+// minor/major version bump of the base image's JDK does not silently break the
+// mount; returns nothing on a JDK that keeps its config inside JAVA_HOME.
+func javaEtcConfigDirs() []string {
+	matches, _ := filepath.Glob("/etc/java-*-openjdk*")
+	var dirs []string
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.IsDir() {
+			dirs = append(dirs, m)
+		}
+	}
+	return dirs
+}
+
+// --- verilog: build-step and run-step mount resolution -----------------------
+
+// resolveVerilogBuildMounts and resolveVerilogRunMounts build the read-only mount
+// lists for the iverilog build step and the vvp run step. Both are thin wrappers
+// over resolveVerilogMounts (the two launchers ship in the same Icarus install and
+// both need the same "ivl base directory"; they differ only in which launcher
+// binary is bound and which helpers contribute shared libraries), and both are
+// package vars so tests can substitute a fake (the real ones inspect the host).
+var resolveVerilogBuildMounts = func(ctx context.Context) ([]string, error) {
+	return resolveVerilogMounts(ctx, iverilogCompiler, true)
+}
+
+var resolveVerilogRunMounts = func(ctx context.Context) ([]string, error) {
+	return resolveVerilogMounts(ctx, vvpRuntime, false)
+}
+
+// shellPath is /bin/sh, which the iverilog driver needs because it invokes its
+// sub-programs (ivlpp, ivl) via system(), i.e. through the shell. It is mounted for
+// the iverilog build step only; the vvp run step deliberately omits it so untrusted
+// Verilog cannot reach a shell through Icarus's $system() system task.
+const shellPath = "/bin/sh"
+
+// resolveVerilogMounts builds the read-only mount list for an Icarus launcher
+// (iverilog or vvp). Neither runs from just its binary plus shared libraries:
+// iverilog is a driver that shells out (via system()) to ivlpp (the preprocessor)
+// and ivl (the compiler), and ivl/vvp in turn dlopen the code-generator target
+// modules (*.tgt) and VPI modules (system.vpi, …) — all of which live in the Icarus
+// "ivl base directory" (e.g. /usr/lib/ivl or the multiarch
+// /usr/lib/x86_64-linux-gnu/ivl). So this profile mounts that whole base directory
+// read-only at its literal path, which is broad but, like the compiler build and
+// JDK profiles, acceptable: the Icarus install is trusted, only the source/.vvp is
+// untrusted, the tree is read-only, and there is no network in the jail.
+//
+// The launcher's own ldd does not reveal the libraries its modules pull in: ivl,
+// the *.tgt code generators and the *.vpi modules are exec'd or dlopen'd, and
+// system.vpi in particular drags in libbz2/libz/libstdc++ that neither launcher
+// links directly. So we additionally ldd every module file in the base directory
+// and fold its libraries into the mount set — mirroring how the java profile ldd's
+// libjvm.so for the launcher's hidden dependencies. (A run that loads system.vpi
+// needs libbz2/libz too, so the run step gets these even though it omits the shell.)
+//
+// needShell adds /bin/sh and its libraries, required only by the iverilog driver
+// (system()); the vvp run step passes false so the sandbox executing untrusted
+// compiled code has no shell to reach via $system().
+//
+// Unlike java, no launcher symlink is needed: Icarus's tools find their base
+// directory from a compiled-in path (overridable with -B), not by deriving it from
+// /proc/self/exe, so binding the real binary straight onto its invocation path is
+// safe.
+func resolveVerilogMounts(ctx context.Context, launcher string, needShell bool) ([]string, error) {
+	realBin, err := filepath.EvalSymlinks(launcher)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", launcher, err)
+	}
+
+	m := newMountSet()
+
+	// The ivl base directory: holds ivl/ivlpp (iverilog shells out to them), the
+	// *.tgt code generators (ivl dlopens them) and the *.vpi modules (ivl and vvp
+	// load them). Mount it whole, read-only.
+	baseDirs := iverilogBaseDirs()
+	if len(baseDirs) == 0 {
+		return nil, fmt.Errorf("verilog mounts: Icarus ivl base directory not found under /usr/lib")
+	}
+	for _, d := range baseDirs {
+		m.addDirRO(d)
+	}
+
+	// The shared libraries the launcher links against (libc, libreadline, …) and the
+	// dynamic loader, plus the libraries the base-dir modules need — ldd of the
+	// launcher alone under-reports these (ivl/ivlpp are exec'd, *.tgt/*.vpi are
+	// dlopen'd). addFileRO drops any that already live inside the mounted base dir.
+	libs, err := sharedLibraries(ctx, realBin)
+	if err != nil {
+		return nil, fmt.Errorf("verilog mounts: %w", err)
+	}
+	// The shell, for the iverilog driver's system() calls. Bound onto /bin/sh (it is
+	// a symlink to dash on Debian) and ldd'd so dash's own libraries come along.
+	if needShell {
+		realShell, err := filepath.EvalSymlinks(shellPath)
+		if err != nil {
+			return nil, fmt.Errorf("verilog mounts: resolve %s: %w", shellPath, err)
+		}
+		m.addFileRO(shellPath) // binds realShell onto /bin/sh (addFileRO resolves the symlink)
+		shLibs, err := sharedLibraries(ctx, realShell)
+		if err != nil {
+			return nil, fmt.Errorf("verilog mounts: %w", err)
+		}
+		libs = append(libs, shLibs...)
+	}
+	// ldd every module file in the base dir and fold in its libraries. Best-effort
+	// per file: a non-dynamic or non-ELF entry (ldd refuses it) is skipped rather
+	// than failing the whole resolution, so an odd file in the dir cannot break
+	// startup — the modules we rely on (system.vpi, vvp.tgt) are dynamic ELF and ldd
+	// cleanly.
+	for _, mod := range iverilogModuleFiles(baseDirs) {
+		modLibs, err := sharedLibraries(ctx, mod)
+		if err != nil {
+			continue
+		}
+		libs = append(libs, modLibs...)
+	}
+	for _, lib := range libs {
+		m.addFileRO(lib)
+	}
+
+	args := m.args()
+	// Bind the real launcher onto its invocation path so execve(launcher) lands on
+	// the real binary (it is normally not a symlink, but resolve-then-bind keeps the
+	// behaviour identical to the interpreter profiles if a distro ever makes it one).
+	args = append(args, "--bindmount_ro", realBin+":"+launcher)
+	return args, nil
+}
+
+// iverilogBaseDirs returns the Icarus "ivl base directory" (or directories) — where
+// ivl, ivlpp, the *.tgt code generators and the *.vpi modules / config live. The
+// location is distro-dependent (Debian uses /usr/lib/ivl on some releases and the
+// multiarch /usr/lib/x86_64-linux-gnu/ivl on others), so it is globbed and validated
+// by content rather than hardcoded, so an image change does not silently break the
+// mount. A directory qualifies if it contains the ivl compiler binary or any Icarus
+// config/system-function-table file.
+func iverilogBaseDirs() []string {
+	var dirs []string
+	seen := map[string]bool{}
+	for _, glob := range []string{
+		"/usr/lib/ivl*",
+		"/usr/lib/*/ivl*",
+		"/usr/local/lib/ivl*",
+	} {
+		matches, _ := filepath.Glob(glob)
+		for _, p := range matches {
+			if seen[p] || !isIverilogBaseDir(p) {
+				continue
+			}
+			seen[p] = true
+			dirs = append(dirs, p)
+		}
+	}
+	return dirs
+}
+
+// isIverilogBaseDir reports whether dir looks like an Icarus base directory: an
+// existing directory holding the ivl compiler or at least one .conf/.sft control
+// file (the markers vvp and iverilog look for there).
+func isIverilogBaseDir(dir string) bool {
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return false
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "ivl")); err == nil && !fi.IsDir() {
+		return true
+	}
+	for _, g := range []string{"*.conf", "*.sft"} {
+		if matches, _ := filepath.Glob(filepath.Join(dir, g)); len(matches) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// iverilogModuleFiles returns the loadable module files inside the ivl base
+// directories — the helper executables (ivl, ivlpp, vhdlpp), the *.tgt code
+// generators and the *.vpi modules — so the caller can ldd each for the shared
+// libraries it needs but the launcher's own ldd does not reveal (these are exec'd
+// or dlopen'd, not linked). Plain config files (*.conf, *.sft) are not returned;
+// the caller ldd's best-effort and skips anything ldd refuses anyway.
+func iverilogModuleFiles(baseDirs []string) []string {
+	var files []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		if seen[p] {
+			return
+		}
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			seen[p] = true
+			files = append(files, p)
+		}
+	}
+	for _, d := range baseDirs {
+		for _, name := range []string{"ivl", "ivlpp", "vhdlpp"} {
+			add(filepath.Join(d, name))
+		}
+		for _, glob := range []string{"*.tgt", "*.vpi"} {
+			matches, _ := filepath.Glob(filepath.Join(d, glob))
+			for _, p := range matches {
+				add(p)
+			}
+		}
+	}
+	return files
 }
 
 // mountSet accumulates deduplicated read-only bind mounts and emits them as

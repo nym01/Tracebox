@@ -82,6 +82,81 @@ c needs **no** separate run profile: `./solution` dispatches to the existing cpp
 run profile, and a C binary links a subset of what the C++ probe pulls in, so the
 cached C++ run set is a safe superset.
 
+## D3 — java filesystem isolation: mount the whole JDK, symlink the launcher (Batch D)
+
+java makes **two** nsjail invocations per request — the `javac` build step and the
+`java` run step — but, unlike cpp/c, they are **not** asymmetric broad-vs-minimal.
+Both get essentially the same profile, because both are JVM launchers and both need
+the entire JDK **runtime image** (`lib/modules`, `lib/server/libjvm.so`, the JDK's
+own `lib/*.so`, and `conf/`) to start at all. There is no "minimal run set" to
+carve out the way there is for a self-contained compiled C/C++ binary — the thing
+being executed (`java`) *is* the full runtime every time.
+
+Because the run launcher is the same `/usr/bin/java` every request (the per-request
+content is the `.class` file in the writable work dir, not the executable), **both**
+java profiles are static and resolved once at startup — no per-request `ldd`, even
+for the run step. This is actually simpler than cpp, whose run step had to probe a
+representative binary.
+
+Each profile mounts the whole `JAVA_HOME` tree (e.g.
+`/usr/lib/jvm/java-17-openjdk-amd64`) read-only at its literal path. Like the
+compiler build profile, this is broad but acceptable: the JDK is trusted, only the
+source/`.class` is untrusted, the tree is read-only, and there is no network in the
+jail. The build step additionally gets a writable tmpfs `/tmp` (the JVM writes
+`/tmp/hsperfdata_*`); the run step deliberately gets none — the JVM degrades
+gracefully without it, and the security-critical step should have nothing spare.
+
+Verified end-to-end in Docker: java hello world builds and runs (`accepted`); a
+program that `Files.readAllBytes(/etc/passwd)` gets `NoSuchFileException`
+(`runtime_error`) because `/etc/passwd` does not exist in the sandbox; a syntax
+error returns `build_failed`; and py3/bash/js/cpp/c/verilog all still return
+`accepted`.
+
+### Why a `--symlink`, not a bind mount, for `/usr/bin/java`
+
+The interpreter profiles bind the real binary onto the invocation path
+(`realpython:/usr/bin/python3`). That would **break** java. The JDK launcher derives
+`JAVA_HOME` at startup by reading `/proc/self/exe` and stripping the trailing
+`bin/<launcher>`. A bind mount onto `/usr/bin/java` makes `/proc/self/exe` report
+`/usr/bin/java`, so the JVM mis-derives `JAVA_HOME` as `/usr`, fails to find
+`/usr/lib/modules`, and aborts ("Error occurred during initialization of VM").
+
+So instead we recreate the original symlink inside the sandbox with nsjail's
+`--symlink JAVA_HOME/bin/java:/usr/bin/java`. `execve("/usr/bin/java")` then resolves
+through the symlink to the real path under the mounted `JAVA_HOME`, and the
+derivation lands on the correct home — exactly as it does unsandboxed on Debian,
+where `/usr/bin/java` is itself an update-alternatives symlink chain.
+
+### Two non-obvious extra mounts the launcher's own `ldd` does not reveal
+
+Getting java to start took two iterations beyond "mount JAVA_HOME + symlink", both
+because the launcher binary's `ldd` under-reports what the JVM actually loads:
+
+1. **`libjvm.so`'s dependencies.** `libjvm.so` is `dlopen`'d by the launcher at
+   runtime, so `ldd /usr/bin/java` does not list its transitive dependencies. The
+   first failure was `dl failure ... libstdc++.so.6: cannot open shared object
+   file` — `libstdc++`, `libgcc_s` and `libm` live in the system lib dir, not under
+   `JAVA_HOME`. Fix: also `ldd` `JAVA_HOME/lib/*/libjvm.so` and fold its system
+   libraries into the mount set (`jvmLibraries` globs for it so a non-`server` VM
+   layout still resolves).
+
+2. **Debian's `/etc/java-*-openjdk` config tree.** Debian splits the editable JDK
+   config (`java.security`, `logging.properties`, …) out into
+   `/etc/java-17-openjdk` and symlinks `JAVA_HOME/conf/**` at it. Those symlinks are
+   *inside* the mounted `JAVA_HOME`, but their targets are not, so the JVM aborted
+   with "Error loading java.security file". Fix: also mount the `/etc/java-*-openjdk`
+   directory read-only (`javaEtcConfigDirs` globs for it, so a version bump still
+   resolves and a non-Debian JDK that keeps config inside `JAVA_HOME` needs no extra
+   mount). Note this mount is what creates `/etc` in the java sandbox — but only
+   `/etc/java-17-openjdk` exists under it, never `/etc/passwd`, so the runtime
+   `/etc/passwd` read still fails as required.
+
+### verilog is the last language still on the shared filesystem
+
+After Batch D only verilog (`iverilog` build, `vvp` run) still uses
+`--disable_clone_newns`. It is the remaining migration before the filesystem-
+isolation gap is fully closed. (Closed in Batch E — see D4.)
+
 ### gcc vs g++ search paths — what actually differs
 
 Asking both drivers on the bookworm image (gcc/g++ 12):
@@ -101,3 +176,59 @@ Docker: c hello world builds and runs (`accepted`); a C program that `fopen`s
 `/etc/passwd` gets a NULL handle (`runtime_error`, prints "nope") because `/etc`
 does not exist in either the build or run sandbox; a malformed C source returns
 `build_failed`; and py3/bash/js/cpp/java/verilog all still return `accepted`.
+
+## D4 — verilog filesystem isolation: mount the ivl base dir, shell only for build (Batch E)
+
+verilog makes **two** nsjail invocations per request — the `iverilog` build step
+(which produces `solution.vvp`) and the `vvp` run step (which executes it). With
+Batch E both move into their own mount namespace, and verilog leaves
+`--disable_clone_newns`. **No language is left on the shared filesystem now**; the
+`--disable_clone_newns` default branch only catches a genuinely unknown command.
+
+Like java, both verilog steps share one resolver (`resolveVerilogMounts`) and both
+are static and cached at startup — the run launcher is the same `vvp` every request
+(the per-request content is the `.vvp` artifact in the writable work dir), so there
+is no per-request `ldd`. This was simpler than java: no `dlopen`'d runtime image to
+chase the way `libjvm.so` was, and **no launcher symlink trick** — Icarus's tools
+find their support files from a compiled-in base path (overridable with `-B`), not by
+deriving a home from `/proc/self/exe`, so a plain bind mount onto `/usr/bin/iverilog`
+/ `/usr/bin/vvp` works.
+
+### Both steps mount the whole Icarus "ivl base directory"
+
+On bookworm the base dir is the multiarch `/usr/lib/x86_64-linux-gnu/ivl` (found by
+globbing `/usr/lib/ivl*` and `/usr/lib/*/ivl*` and validating by content — it holds
+the `ivl` binary and `*.conf` files — so a distro/layout change doesn't silently
+break the mount). It contains the programs `iverilog` shells out to (`ivl`, `ivlpp`),
+the `*.tgt` code generators `ivl` dlopens (`vvp.tgt` emits the `.vvp`), and the
+`*.vpi` modules `ivl`/`vvp` load (`system.vpi` provides `$display`, `$finish`, …).
+Both steps mount this whole tree read-only at its literal path — broad but, like the
+compiler-build and JDK profiles, acceptable: the Icarus install is trusted, only the
+source/`.vvp` is untrusted, the tree is read-only, and there is no network in the jail.
+
+### Two non-obvious requirements the launcher's own `ldd` does not reveal
+
+Getting verilog to run took two iterations beyond "mount the base dir + the launcher's
+libraries", both because the launcher binary's `ldd` under-reports what actually runs:
+
+1. **`/bin/sh` for the build step.** `iverilog` is a driver that invokes `ivlpp` and
+   `ivl` via `system()`, i.e. through the shell. Without `/bin/sh` (dash) the build
+   exits 127 with empty stderr (`build_failed` and a confusing silent failure). Fix:
+   the build profile binds the real dash onto `/bin/sh` and `ldd`s it. The **run
+   profile deliberately omits the shell** — defense in depth, so the sandbox executing
+   untrusted compiled code has no shell to reach even via Icarus's `$system()` task.
+
+2. **The VPI/target modules' own libraries.** `system.vpi` drags in
+   `libbz2`/`libz`/`libstdc++` that neither launcher links directly (the modules are
+   exec'd or `dlopen`'d, so `ldd` of `iverilog`/`vvp` misses them). The first run failed
+   to load `system.vpi` ("`libbz2.so.1.0`: cannot open shared object file"). Fix:
+   additionally `ldd` every module file in the base dir (`ivl`, `ivlpp`, `vhdlpp`,
+   `*.tgt`, `*.vpi`) and fold in its libraries, best-effort (a non-dynamic file `ldd`
+   refuses is skipped, never failing startup). Because `vvp` loads `system.vpi` at
+   runtime too, the run step gets `libbz2`/`libz` as well — necessary, not spare.
+
+Verified end-to-end in Docker (Icarus 11.0): verilog hello world builds and runs
+(`accepted`); a program that `$fopen`s `/etc/passwd` at runtime gets a 0 handle and
+prints "nope" (`accepted`) because `/etc` does not exist in the run sandbox; a syntax
+error returns `build_failed`; `$system("true")` does not reach a shell; and
+py3/bash/js/cpp/c/java all still return `accepted`, with all three endpoints 200.
