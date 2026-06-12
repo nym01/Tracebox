@@ -232,3 +232,78 @@ Verified end-to-end in Docker (Icarus 11.0): verilog hello world builds and runs
 prints "nope" (`accepted`) because `/etc` does not exist in the run sandbox; a syntax
 error returns `build_failed`; `$system("true")` does not reach a shell; and
 py3/bash/js/cpp/c/java all still return `accepted`, with all three endpoints 200.
+
+## D5 — seccomp syscall filter: a uniform kafel deny-list (Phase 1, step 2)
+
+The sandbox now applies a seccomp-BPF filter (`configs/seccomp.policy`, compiled by
+nsjail's kafel) to **every** language's child process via `--seccomp_policy`. It is
+the same policy for all seven languages and both the build and run steps — wired
+into the shared base args (`buildNsjailArgs`), not `filesystemArgs` — so there are
+**no per-language seccomp branches**. The policy path is resolved (and the file's
+existence checked) once at startup in `NewNsjailRunner`, so a missing/mis-deployed
+policy fails loudly at boot rather than per request, exactly like a failed mount
+resolution.
+
+### Why a deny-list, not an allow-list
+
+Phase 1 deliberately ships a **conservative deny-list** (`DEFAULT ALLOW`, `KILL` a
+fixed set of dangerous syscalls) rather than a default-deny allow-list. Seven very
+different runtimes (CPython, V8/node, the JVM, g++/gcc toolchains, Icarus, dash)
+each issue a wide and version-dependent syscall set; an allow-list tight enough to
+be worthwhile is also tight enough to silently break one of them, and getting it
+exhaustively right is a separate, later hardening step. The deny-list instead closes
+the specific escape / host-tampering primitives untrusted code has no legitimate
+reason to use, while leaving normal compile/run syscalls (open, read, write, mmap,
+clone, execve, …) untouched. `KILL` (SECCOMP_RET_KILL) means the task dies the
+instant it makes a denied call, so the handler observes it as the program dying —
+`runtime_error` — not as an ignorable error return.
+
+The denied set (per notes.md): `ptrace`, `bpf`, `mount`, `umount`(2), `kexec_load`,
+`init_module`, `finit_module`, `delete_module`, `reboot`, `swapon`, `swapoff`,
+`setns`, and dangerous `unshare`.
+
+### Why denying these in the child does not break nsjail's own setup
+
+nsjail performs its namespace/mount/cgroup setup in the **parent**, before the
+seccomp filter is installed on the child (just prior to `execve`). So denying
+`mount`, `setns` and `unshare` to the child does not interfere with nsjail creating
+the mount namespace or applying the read-only bind mounts — it only stops the
+untrusted program from undoing them. Verified: all seven hello-worlds still build
+and run (`accepted`) with the filter active.
+
+### `unshare` is filtered on its argument, not blanket-killed
+
+A blanket `unshare` KILL would be broader than "dangerous usage" — `unshare(2)` has
+harmless flags (e.g. `CLONE_FILES`, `CLONE_FS`). The dangerous ones are new-namespace
+creation, above all `CLONE_NEWUSER` (a new user namespace hands the caller a full
+capability set inside it — the classic privilege-escalation primitive) and
+`CLONE_NEWNS` (a new mount namespace). kafel can match on syscall arguments, so the
+rule is `unshare { (unshare_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 }`. Verified
+in Docker: a C program calling `unshare(CLONE_NEWUSER)` is killed (`runtime_error`,
+no output), while `unshare(CLONE_FILES)` runs to completion (`accepted`, prints
+"survived").
+
+### Two kafel-syntax gotchas worth remembering
+
+1. **Comments are `//` and `/* */`, not `#`.** A leading `#` is reserved for
+   `#define`; a `#`-style comment makes kafel fail with "unexpected IDENTIFIER,
+   expecting DEFINE" and nsjail then aborts ("Couldn't prepare sandboxing policy").
+2. **The syscall is named `umount`, not `umount2`.** kafel's amd64 table maps the
+   name `umount` to syscall 166 — which *is* `umount2` on x86-64 (there is no legacy
+   `umount`). Writing `umount2` gives "Undefined identifier `umount2`".
+   `CLONE_NEWUSER`/`CLONE_NEWNS` likewise have no built-in names and are `#define`d
+   to their stable kernel ABI values in the policy.
+
+### Verifying the ptrace kill: C, not py3+ctypes
+
+notes.md's suggested check is a py3 program that calls `ptrace` via `ctypes`. Under
+the current py3 filesystem profile that test returns `runtime_error`, but for the
+**wrong reason**: `ctypes` fails to import because `libffi.so.8` is not in the py3
+mount set, so `ptrace` is never reached — the failure proves nothing about seccomp.
+The kill was therefore verified with a compiled C program that genuinely issues the
+syscall: `ptrace(PTRACE_TRACEME,0,0,0); printf("survived")` returns `runtime_error`
+with empty stdout (killed before the print), while the identical program **without**
+the `ptrace` line returns `accepted` and prints "survived" — isolating the kill to
+the `ptrace` call. (Making the py3+ctypes route demonstrate this too would require
+adding `libffi` to the py3 mount profile — a filesystem-isolation change, out of
+scope for the seccomp step.)

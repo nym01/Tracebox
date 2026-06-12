@@ -42,11 +42,13 @@ func withStubbedResolvers(t *testing.T, py3, bash, js resolverFn) {
 	origCppBuild, origCBuild, origCppRun := resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts
 	origJavaBuild, origJavaRun := resolveJavaBuildMounts, resolveJavaRunMounts
 	origVerilogBuild, origVerilogRun := resolveVerilogBuildMounts, resolveVerilogRunMounts
+	origSeccomp := resolveSeccompPolicy
 	t.Cleanup(func() {
 		resolvePy3Mounts, resolveBashMounts, resolveJsMounts = origPy3, origBash, origJs
 		resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = origCppBuild, origCBuild, origCppRun
 		resolveJavaBuildMounts, resolveJavaRunMounts = origJavaBuild, origJavaRun
 		resolveVerilogBuildMounts, resolveVerilogRunMounts = origVerilogBuild, origVerilogRun
+		resolveSeccompPolicy = origSeccomp
 	})
 	noop := func(context.Context) ([]string, error) { return nil, nil }
 	if py3 == nil {
@@ -62,7 +64,15 @@ func withStubbedResolvers(t *testing.T, py3, bash, js resolverFn) {
 	resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = noop, noop, noop
 	resolveJavaBuildMounts, resolveJavaRunMounts = noop, noop
 	resolveVerilogBuildMounts, resolveVerilogRunMounts = noop, noop
+	// Stub the seccomp policy resolver too so unit tests never touch the on-disk
+	// policy file (it lives at configs/seccomp.policy relative to the repo root,
+	// not the package dir). The dedicated seccomp test overrides this afterward.
+	resolveSeccompPolicy = func(context.Context) (string, error) { return stubSeccompPolicyPath, nil }
 }
+
+// stubSeccompPolicyPath is the fixed policy path the stubbed resolver returns in
+// unit tests, standing in for the real configs/seccomp.policy.
+const stubSeccompPolicyPath = "configs/seccomp.policy"
 
 // assertMountsResolvedOnceAndReused verifies that the expensive mount resolution
 // for one interpreted language (which shells out to ldd) happens exactly once, at
@@ -692,6 +702,117 @@ func TestNewNsjailRunnerFailsLoudlyOnVerilogResolveError(t *testing.T) {
 		resolveVerilogRunMounts = fail
 		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
 			t.Fatal("expected NewNsjailRunner to error when verilog run mounts cannot be resolved")
+		}
+	})
+}
+
+// seccompFlagIndex returns the index of "--seccomp_policy" in args, or -1 if it
+// is absent. The flag's value is the following element.
+func seccompFlagIndex(args []string) int {
+	for i, a := range args {
+		if a == "--seccomp_policy" {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestSeccompPolicyResolvedAndStored confirms the policy path is resolved at
+// construction and stored on the runner, and that a resolution failure makes
+// construction fail loudly (so main can treat it as fatal) rather than deferring
+// the error to the first request.
+func TestSeccompPolicyResolvedAndStored(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	resolveSeccompPolicy = func(context.Context) (string, error) { return "/some/seccomp.policy", nil }
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+	if r.SeccompPolicyPath != "/some/seccomp.policy" {
+		t.Fatalf("SeccompPolicyPath = %q, want %q", r.SeccompPolicyPath, "/some/seccomp.policy")
+	}
+
+	t.Run("fails loudly", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveSeccompPolicy = func(context.Context) (string, error) {
+			return "", fmt.Errorf("seccomp policy not found")
+		}
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when the seccomp policy cannot be resolved")
+		}
+	})
+}
+
+// TestSeccompPolicyPassedToNsjailForEveryLanguage is the core seccomp test: it
+// confirms the resolved policy file is handed to nsjail via --seccomp_policy for
+// every one of the seven languages' command variants (interpreters, both compiler
+// build steps, both compiled-artifact run steps, and the java/verilog launchers).
+// The filter must be uniform — applied to all languages identically — and must
+// target nsjail itself, i.e. appear before the "--" that separates nsjail's flags
+// from the sandboxed command.
+func TestSeccompPolicyPassedToNsjailForEveryLanguage(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	const policy = "configs/seccomp.policy"
+	resolveSeccompPolicy = func(context.Context) (string, error) { return policy, nil }
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	// Every command the seven languages can invoke. Each must carry the seccomp
+	// flag; none is exempt.
+	commands := map[string]string{
+		"py3":           pythonInterpreter,
+		"bash":          bashInterpreter,
+		"js":            nodeInterpreter,
+		"cpp build":     cppCompiler,
+		"c build":       cCompiler,
+		"compiled run":  "./solution",
+		"java build":    javacCompiler,
+		"java run":      javaRuntime,
+		"verilog build": iverilogCompiler,
+		"verilog run":   vvpRuntime,
+	}
+
+	for name, cmd := range commands {
+		t.Run(name, func(t *testing.T) {
+			args := r.buildNsjailArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/work"}, 10)
+
+			idx := seccompFlagIndex(args)
+			if idx < 0 {
+				t.Fatalf("%s: --seccomp_policy missing from nsjail args: %v", cmd, args)
+			}
+			if idx+1 >= len(args) || args[idx+1] != policy {
+				t.Fatalf("%s: --seccomp_policy value = %q, want %q", cmd, args[idx+1], policy)
+			}
+
+			// The flag must configure nsjail, not be handed to the sandboxed
+			// program, so it must come before the "--" separator.
+			sep := -1
+			for i, a := range args {
+				if a == "--" {
+					sep = i
+					break
+				}
+			}
+			if sep < 0 {
+				t.Fatalf("%s: no \"--\" separator in args: %v", cmd, args)
+			}
+			if idx > sep {
+				t.Fatalf("%s: --seccomp_policy (idx %d) appears after \"--\" (idx %d)", cmd, idx, sep)
+			}
+		})
+	}
+
+	// An unknown command (the --disable_clone_newns fallback) must still get the
+	// seccomp filter — it is uniform across every invocation, not tied to a
+	// recognised language profile.
+	t.Run("unknown command still filtered", func(t *testing.T) {
+		args := r.buildNsjailArgs(RunSpec{Cmd: "/bin/some-unknown-tool", WorkDir: "/tmp/work"}, 10)
+		if seccompFlagIndex(args) < 0 {
+			t.Fatalf("unknown command: --seccomp_policy missing: %v", args)
 		}
 	})
 }

@@ -46,6 +46,24 @@ const (
 // of a compiled language and gets the compiled-artifact mount profile.
 const artifactRunPrefix = "./"
 
+// defaultSeccompPolicyPath is where the kafel seccomp deny-list policy is shipped
+// in the image (the Dockerfile copies configs/ into the working directory /app, so
+// this relative path resolves at runtime). It is passed to nsjail unchanged via
+// --seccomp_policy for every language.
+const defaultSeccompPolicyPath = "configs/seccomp.policy"
+
+// resolveSeccompPolicy returns the path to the seccomp policy file to hand nsjail,
+// after verifying it exists. Resolving at startup means a missing or mis-deployed
+// policy fails loudly when the runner is constructed (exactly like a failed mount
+// resolution) instead of surfacing as a per-request nsjail error. It is a package
+// var so tests can substitute a fake that does not touch disk.
+var resolveSeccompPolicy = func(ctx context.Context) (string, error) {
+	if _, err := os.Stat(defaultSeccompPolicyPath); err != nil {
+		return "", fmt.Errorf("seccomp policy %s: %w", defaultSeccompPolicyPath, err)
+	}
+	return defaultSeccompPolicyPath, nil
+}
+
 // NsjailRunner runs the command inside an nsjail sandbox. It implements the
 // same Runner interface as SubprocessRunner and returns the identical
 // RunResult shape, so callers can swap between the two without changes.
@@ -113,6 +131,16 @@ type NsjailRunner struct {
 	// and cached at startup.
 	verilogBuildMounts []string
 	verilogRunMounts   []string
+
+	// SeccompPolicyPath is the path to the kafel seccomp deny-list policy
+	// (configs/seccomp.policy) that is passed to nsjail via --seccomp_policy. The
+	// same policy applies to every language uniformly — it filters dangerous
+	// syscalls (ptrace, bpf, mount, kexec_load, …) in the sandboxed child and is
+	// orthogonal to the per-language filesystem mounts. It is resolved once by
+	// NewNsjailRunner (which verifies the file exists, so a missing policy fails at
+	// startup rather than per request); an empty value means no policy is passed
+	// (only the zero-value runner used by the compile-time assertions).
+	SeccompPolicyPath string
 }
 
 // NewNsjailRunner constructs an NsjailRunner with its per-language filesystem
@@ -164,6 +192,10 @@ func NewNsjailRunner(ctx context.Context, nsjailPath string) (NsjailRunner, erro
 	if err != nil {
 		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve verilog run mounts: %w", err)
 	}
+	seccompPolicy, err := resolveSeccompPolicy(ctx)
+	if err != nil {
+		return NsjailRunner{}, fmt.Errorf("nsjail runner: resolve seccomp policy: %w", err)
+	}
 	return NsjailRunner{
 		NsjailPath:         nsjailPath,
 		py3Mounts:          py3,
@@ -176,6 +208,7 @@ func NewNsjailRunner(ctx context.Context, nsjailPath string) (NsjailRunner, erro
 		javaRunMounts:      javaRun,
 		verilogBuildMounts: verilogBuild,
 		verilogRunMounts:   verilogRun,
+		SeccompPolicyPath:  seccompPolicy,
 	}, nil
 }
 
@@ -196,40 +229,7 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 		nsjailPath = "nsjail"
 	}
 
-	nsjailArgs := []string{
-		"--mode", "o", // one-shot: run the command once and exit
-		"--time_limit", strconv.Itoa(wallSec),
-		"--really_quiet", // suppress nsjail's own logging so only child stdio remains
-		// Give the child a PATH. nsjail starts the child with an empty environment
-		// by default; compiler drivers then fail because they shell out to helper
-		// tools by name — e.g. g++/gcc invoke "ld" and "as" via PATH ("collect2:
-		// fatal error: cannot find 'ld'"). SubprocessRunner inherits the server's
-		// environment, so this restores parity for every language's toolchain.
-		"--env", "PATH=/usr/local/bin:/usr/bin:/bin",
-		// Do NOT cap the virtual address space. --rlimit_as limits *virtual* memory,
-		// not resident memory, and managed runtimes reserve enormous virtual regions
-		// up front regardless of actual use: Node's V8 ("Failed to reserve virtual
-		// memory for CodeRange") and the JVM ("Could not reserve enough space for
-		// object heap" / pthread_create EAGAIN on thread-stack mmap) both abort under
-		// any practical --rlimit_as. nsjail's own default rlimit_as (4 GiB) is also
-		// too small for them, so we explicitly lift it. SubprocessRunner enforces no
-		// memory limit either, so this matches its behavior; real (resident) memory
-		// capping belongs in a cgroup limit, which is a separate hardening step.
-		"--rlimit_as", "max",
-	}
-
-	// Filesystem isolation: py3 gets a fresh mount namespace with a minimal
-	// read-only root; every other language still shares the host filesystem.
-	nsjailArgs = append(nsjailArgs, r.filesystemArgs(spec)...)
-
-	// Run inside the per-request working directory so relative artifacts (e.g.
-	// ./solution) and the source file resolve exactly as under SubprocessRunner.
-	if spec.WorkDir != "" {
-		nsjailArgs = append(nsjailArgs, "--cwd", spec.WorkDir)
-	}
-	// Everything after "--" is the command and its arguments.
-	nsjailArgs = append(nsjailArgs, "--", spec.Cmd)
-	nsjailArgs = append(nsjailArgs, spec.Args...)
+	nsjailArgs := r.buildNsjailArgs(spec, wallSec)
 
 	cmd := exec.CommandContext(runCtx, nsjailPath, nsjailArgs...)
 	cmd.Stdin = strings.NewReader(spec.Stdin)
@@ -282,6 +282,61 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 		}
 	}
 	return res, nil
+}
+
+// buildNsjailArgs assembles the full nsjail argument vector for one request: the
+// base sandbox flags, the uniform seccomp policy, the per-language filesystem
+// profile, the working directory, and finally the command and its arguments. It is
+// split out from Run (which only execs the result) so the argument construction —
+// in particular that the seccomp policy is applied to every language — is unit
+// testable without actually invoking nsjail.
+func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
+	args := []string{
+		"--mode", "o", // one-shot: run the command once and exit
+		"--time_limit", strconv.Itoa(wallSec),
+		"--really_quiet", // suppress nsjail's own logging so only child stdio remains
+		// Give the child a PATH. nsjail starts the child with an empty environment
+		// by default; compiler drivers then fail because they shell out to helper
+		// tools by name — e.g. g++/gcc invoke "ld" and "as" via PATH ("collect2:
+		// fatal error: cannot find 'ld'"). SubprocessRunner inherits the server's
+		// environment, so this restores parity for every language's toolchain.
+		"--env", "PATH=/usr/local/bin:/usr/bin:/bin",
+		// Do NOT cap the virtual address space. --rlimit_as limits *virtual* memory,
+		// not resident memory, and managed runtimes reserve enormous virtual regions
+		// up front regardless of actual use: Node's V8 ("Failed to reserve virtual
+		// memory for CodeRange") and the JVM ("Could not reserve enough space for
+		// object heap" / pthread_create EAGAIN on thread-stack mmap) both abort under
+		// any practical --rlimit_as. nsjail's own default rlimit_as (4 GiB) is also
+		// too small for them, so we explicitly lift it. SubprocessRunner enforces no
+		// memory limit either, so this matches its behavior; real (resident) memory
+		// capping belongs in a cgroup limit, which is a separate hardening step.
+		"--rlimit_as", "max",
+	}
+
+	// Seccomp syscall filter, applied UNIFORMLY to every language. The kafel
+	// deny-list policy (configs/seccomp.policy) KILLs a fixed set of dangerous
+	// syscalls (ptrace, bpf, mount, kexec_load, …) in the sandboxed child and is
+	// independent of the per-language filesystem mounts, so it is added here in the
+	// shared base rather than in filesystemArgs. Empty only for the zero-value
+	// runner (the compile-time assertions); a real NsjailRunner always has it set.
+	if r.SeccompPolicyPath != "" {
+		args = append(args, "--seccomp_policy", r.SeccompPolicyPath)
+	}
+
+	// Filesystem isolation: each language gets a fresh mount namespace with a
+	// minimal read-only root (or the --disable_clone_newns fallback for an unknown
+	// command).
+	args = append(args, r.filesystemArgs(spec)...)
+
+	// Run inside the per-request working directory so relative artifacts (e.g.
+	// ./solution) and the source file resolve exactly as under SubprocessRunner.
+	if spec.WorkDir != "" {
+		args = append(args, "--cwd", spec.WorkDir)
+	}
+	// Everything after "--" is the command and its arguments.
+	args = append(args, "--", spec.Cmd)
+	args = append(args, spec.Args...)
+	return args
 }
 
 // filesystemArgs returns the nsjail flags that set up the child's filesystem

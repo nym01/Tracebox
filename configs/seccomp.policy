@@ -1,0 +1,86 @@
+// Tracebox seccomp deny-list policy (kafel language, compiled to seccomp-BPF
+// by nsjail via --seccomp_policy).
+//
+// Phase 1 scope: a CONSERVATIVE DENY-LIST. Everything is ALLOWed by default
+// (see the DEFAULT ALLOW at the bottom); only the handful of unambiguously
+// dangerous syscalls below are KILLed. This is intentionally NOT an allow-list
+// — an allow-list that is too tight silently breaks one of the seven language
+// runtimes, and getting it exhaustively right for py3/cpp/c/bash/js/java/verilog
+// is a later, separate hardening step. The deny-list closes the specific
+// escape/host-tampering primitives a sandboxed program has no legitimate reason
+// to use, while leaving normal compile/run syscalls (open, read, write, mmap,
+// clone, execve, …) untouched.
+//
+// The filter is applied to the SANDBOXED CHILD just before execve. nsjail itself
+// sets up namespaces, mounts and cgroups in the parent BEFORE this filter takes
+// effect, so denying mount/setns/unshare here does not interfere with nsjail's
+// own setup — it only stops the untrusted program from doing those things.
+//
+// KILL means the offending task is killed (SECCOMP_RET_KILL) the instant it
+// makes the call, so a denied syscall surfaces to the handler as the program
+// dying — i.e. runtime_error — not as an error return it could ignore.
+//
+// NOTE on syntax: kafel comments are // and /* */ only; a leading # is reserved
+// for #define. The two #define lines below add the clone/unshare namespace flag
+// constants kafel has no built-in names for (values are stable kernel ABI).
+// CLONE_NEWUSER is the classic privilege-escalation primitive (a new user
+// namespace hands the caller a full capability set inside it); CLONE_NEWNS
+// creates a new mount namespace.
+#define CLONE_NEWNS    0x00020000
+#define CLONE_NEWUSER  0x10000000
+
+POLICY tracebox {
+  KILL {
+    // --- Debugging / introspection of other processes ----------------------
+    // ptrace: attach to and control another process — read/write its memory and
+    // registers, hijack its execution. The canonical sandbox-escape and
+    // anti-analysis primitive; nothing we run legitimately needs it.
+    ptrace,
+
+    // --- Kernel-level programmability --------------------------------------
+    // bpf: load BPF programs into the kernel (kprobes, tracing, networking
+    // hooks). A large kernel attack surface and a way to observe/tamper far
+    // beyond the sandbox.
+    bpf,
+
+    // --- Filesystem topology tampering -------------------------------------
+    // mount / umount: change the mount table — e.g. remount something
+    // read-write, bind in a host path, or detach a protective mount. Would
+    // undermine the read-only bind-mount filesystem isolation. ("umount" is
+    // kafel's name for the amd64 umount2 syscall, no. 166; there is no legacy
+    // umount on x86-64.)
+    mount,
+    umount,
+
+    // --- Loading code into / rebooting the kernel --------------------------
+    // kexec_load: stage a new kernel to boot into — total host takeover.
+    kexec_load,
+    // init_module / finit_module: load a kernel module (arbitrary kernel code).
+    init_module,
+    finit_module,
+    // delete_module: unload a kernel module — e.g. remove a security module.
+    delete_module,
+    // reboot: reboot or halt the machine — host-level denial of service.
+    reboot,
+
+    // --- Swap manipulation -------------------------------------------------
+    // swapon / swapoff: enable or disable swap devices — host resource and
+    // availability tampering.
+    swapon,
+    swapoff,
+
+    // --- Namespace entry / dangerous creation ------------------------------
+    // setns: join an existing namespace by fd — a way to step out of the
+    // sandbox's namespaces into another (e.g. the host's).
+    setns,
+    // unshare: only the dangerous namespace types. Creating a new USER namespace
+    // grants capabilities that can be leveraged to undo isolation; a new MOUNT
+    // namespace lets the program restructure its own mounts. Other unshare flags
+    // (e.g. files/fs) are harmless and stay allowed, so this is filtered on the
+    // flag argument rather than blanket-killed.
+    unshare { (unshare_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 }
+  }
+}
+
+// Deny-list semantics: anything not matched by the KILL block above is allowed.
+USE tracebox DEFAULT ALLOW
