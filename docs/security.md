@@ -73,15 +73,18 @@ are enforced.
 **Things outside the sandbox that are still part of the attack surface even if
 the sandbox itself is perfect:**
 - The container currently runs with `--privileged`, which grants a very broad
-  set of capabilities to the container — broader than strictly required for
+  set of capabilities to the **container** — broader than strictly required for
   nsjail's namespace/cgroup operations. This is itself a larger attack surface
-  than a minimally-capable container.
+  than a minimally-capable container. Note this grant stops at the container
+  boundary: the sandboxed child is capability-less (verified — see "Known
+  limitations" / escape suite test 14).
 - The goboxd Go process itself — a bug in request validation, YAML loading, or
   the runner code could be exploitable independent of the sandbox's correctness.
 - The Docker daemon and container runtime — vulnerabilities here are outside
   Tracebox's control entirely.
-- Network access from within the sandbox — not explicitly addressed by the
-  three pillars above; the network namespace configuration needs review.
+- Network access from within the sandbox — reviewed: the sandbox runs in a fresh,
+  empty network namespace (only loopback, no routes), so sandboxed code cannot
+  reach the network (verified — see "Known limitations" / escape suite test 15).
 
 ## Strengthening the boundary
 
@@ -116,7 +119,23 @@ short-lived sandboxes" usage pattern this service has.
 - **`--privileged`** is a broad capability grant used to give nsjail the
   permissions it needs for namespaces and cgroups. A more minimal set of
   `--cap-add` flags scoped to exactly what's needed would reduce the attack
-  surface of the container itself, independent of the sandbox inside it.
+  surface of the **container itself**, independent of the sandbox inside it. The
+  important clarification (reviewed — escape suite Group 4, test 14): this grant
+  does **not** reach the sandboxed child. The escape suite confirms the sandboxed
+  process runs as uid 0 but with **all five capability masks empty**
+  (`CapInh/CapPrm/CapEff/CapBnd/CapAmb = 0000000000000000`) — nsjail drops every
+  capability for the child by default. `CapBnd` (the bounding set) being empty is
+  the strongest part: the process can never *regain* a capability even via a
+  setuid-root binary, so it is root-without-power. Corroborated by two
+  capability-gated syscalls that are *not* on the seccomp deny-list — `chroot()`
+  (needs `CAP_SYS_CHROOT`) and `sethostname()` (needs `CAP_SYS_ADMIN`) — both
+  returning `EPERM` while the program runs to completion (a true capability
+  denial, not a SIGSYS kill). So `--privileged` widens the *container's* attack
+  surface, not the sandbox's; tightening it to scoped `--cap-add` flags remains
+  worthwhile defense-in-depth, but the sandboxed code itself is already
+  capability-less. This capability drop, like the PID-namespace isolation below,
+  rests on an nsjail default (it does not pass `--keep_caps`) rather than an
+  explicit flag.
 - **Filesystem isolation, seccomp, and cgroup enforcement are all ultimately
   kernel-enforced** — see "The boundary: shared kernel" above. This is the
   fundamental limitation of this entire approach, not a bug to fix, but the
@@ -126,9 +145,20 @@ short-lived sandboxes" usage pattern this service has.
   language runtimes with minimal per-language tuning), but it means any
   dangerous syscall not explicitly anticipated and added to the deny-list is,
   by default, allowed.
-- **Network namespace configuration** was not a focus of the three pillars
-  above and needs explicit review — what network access, if any, does
-  sandboxed code currently have?
+- **Network namespace configuration** — reviewed (escape suite Group 4, test
+  15): the network namespace **isolates outbound connections**, confirmed
+  against the live sandbox. A non-blocking `connect()` to `8.8.8.8:53` fails
+  *immediately* with `ENETUNREACH` (errno 101, ~0 ms — not a hang), and the
+  sandbox's network namespace contains **only the loopback device** (`/proc/net/dev`
+  lists just `lo`; `/sys/class/net` does not exist) with an **empty routing table**
+  (`/proc/net/route` has zero entries — not even a default route). Sandboxed code
+  has no route off the box, so exfiltration / SSRF / C2 over the network is not
+  possible. Like the PID-namespace isolation below, this rests on an **nsjail
+  default**, not an explicit flag: nsjail clones a fresh network namespace unless
+  `--disable_clone_newnet` is given, and `buildNsjailArgs` emits no network flag
+  (the "no network in the jail" comments in `internal/runner/nsjail.go` are
+  descriptive, not enforcing). It would therefore silently regress if
+  `--disable_clone_newnet` were ever added to the argument builder.
 - **Process-count limiting (`max_processes`) is enforced via a cgroup v2
   `pids.max` limit.** Every language in `configs/languages.yaml` carries a
   `max_processes` budget; it is parsed (`internal/language`), clamped on a

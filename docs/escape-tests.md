@@ -250,3 +250,72 @@ pages (unlike `MAP_PRIVATE`) are charged even on read.
 
 - `go test ./...` — pass (unit/feature suites unaffected by the new `escapetests`-tagged files).
 - `go vet ./...` and `go vet -tags escapetests ./escapetests/...` — clean.
+
+---
+
+## Group 4 — shared-kernel boundary (capabilities + network)
+
+Target: the residual attack surface `docs/security.md` flags *outside* the three
+named pillars. The container runs `--privileged` (a broad capability grant) and
+the threat model lists both "--privileged" and "network namespace configuration
+needs review" as open known limitations. These two tests answer them against the
+live sandbox rather than by assumption. Both **held** — and both are positive
+findings that tighten a previously-open limitation rather than revealing a gap.
+
+| # | Test | Attempt | Result | Outcome |
+|---|------|---------|--------|---------|
+| 14 | `TestEffectiveCapabilities` | read `/proc/self/status` Cap* masks; corroborate with `chroot("/")` + `sethostname()` (C) | uid 0 but **all five masks empty** (`CapInh/CapPrm/CapEff/CapBnd/CapAmb = 0000000000000000`); `chroot`/`sethostname` → `EPERM` (errno 1), program reaches `AFTER` (not seccomp-killed) | **Held (expected) — capabilities fully dropped despite `--privileged`** |
+| 15 | `TestOutboundNetworkBlocked` | non-blocking `connect()` to `8.8.8.8:53` + `select(5s)` (C); corroborate via `/proc/net/dev` + `/proc/net/route` (py3) | `connect()` fails **immediately** with `ENETUNREACH` (errno 101) in ~0 ms; only `lo` interface, **0 route entries** | **Held (expected) — isolated, empty network namespace** |
+
+### Notes on individual tests
+
+**Test 14 — `--privileged` does not reach inside the sandbox.** The key
+distinction the notes anticipated: `--privileged` grants capabilities to the
+**container**, but nsjail drops them for the **child** independently. It does:
+the sandboxed process runs as uid 0 (root) yet every capability mask is empty.
+The most important of the five is **`CapBnd` (the bounding set) being empty** —
+that caps what the process could ever acquire, so it can never *regain* a
+capability even by exec'ing a setuid-root binary; root here is genuinely
+powerless. The corroboration removes any doubt that the zeros are cosmetic:
+`chroot("/")` (needs `CAP_SYS_CHROOT`) and `sethostname()` (needs
+`CAP_SYS_ADMIN`) both return `EPERM`, and because neither syscall is on the
+seccomp deny-list the program runs *past* them to print `AFTER` — so the `EPERM`
+is a true capability denial, not a Group-2 SIGSYS kill. `NoNewPrivs:1` and
+`Seccomp:2` (filter mode) also show in the same dump, consistent with Group 2.
+This is the inverse of a gap: the `--privileged` known limitation is materially
+narrower than the threat model assumed — the *container* is privileged, the
+*sandbox* is capability-less.
+
+**Test 15 — outbound network is isolated, not merely unrouted.** The non-blocking
+connect + `select` design distinguishes the three outcomes the notes called out
+(immediate fail / success / hang). The result is the cleanest of the three:
+`connect()` to `8.8.8.8:53` fails **immediately** with `ENETUNREACH` (errno 101)
+in ~0 ms — not a hang (no routing that times out) and not a success. The
+corroboration shows why: the sandbox's network namespace contains **only the
+loopback device** (`/proc/net/dev` lists just `lo`, and `/sys/class/net` does not
+exist) and an **empty routing table** (`/proc/net/route` has zero entries — not
+even a default route). There is simply nowhere for a packet to go.
+
+Like Group 1's PID-namespace finding (test 5), this isolation is **inherited from
+nsjail's default**, not explicitly configured: nsjail clones a fresh network
+namespace unless `--disable_clone_newnet` is passed, and `buildNsjailArgs`
+(`internal/runner/nsjail.go`) emits no network flag at all — the comments there
+("no network in the jail") are descriptive, not enforcing. So, exactly as with
+the PID namespace, this would silently regress if `--disable_clone_newnet` were
+ever added to the argument builder.
+
+### No new gaps — two open limitations tightened
+
+Group 4 surfaced no failures. Better than that, it converts two of
+`docs/security.md`'s open known limitations from "needs review" into reviewed,
+test-backed positive findings: `--privileged` grants the container broad
+capabilities but the sandboxed child has **none** (test 14), and outbound network
+is **isolated** by a fresh, empty network namespace (test 15). Both rest on
+nsjail defaults (capability drop; netns clone) rather than explicit flags — worth
+recording so neither silently regresses.
+
+### Regression
+
+- `go test ./...` — pass (unit/feature suites unaffected by the new `escapetests`-tagged files).
+- `go test -tags escapetests -v ./escapetests/...` — all 15 pass.
+- `go vet ./...` and `go vet -tags escapetests ./escapetests/...` — clean.
