@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -15,33 +17,69 @@ var (
 	_ Runner = SubprocessRunner{}
 )
 
-// withStubbedPy3Resolver swaps resolvePy3Mounts for the duration of a test and
-// restores it afterward.
-func withStubbedPy3Resolver(t *testing.T, fn func(context.Context) ([]string, error)) {
+// resolverFn is the signature of the per-language mount resolvers
+// (resolvePy3Mounts, resolveBashMounts, resolveJsMounts).
+type resolverFn func(context.Context) ([]string, error)
+
+// withStubbedResolvers swaps every per-profile mount resolver for the duration of
+// a test and restores them afterward. The three interpreted-language resolvers can
+// be supplied by the caller; a nil argument is replaced with a no-op resolver that
+// succeeds with no mounts, so a test only has to supply the resolver(s) it cares
+// about while the others stay out of the way (and, in particular, never shell out
+// to ldd on a host that lacks the interpreter).
+//
+// The three compiled-language resolvers (cpp build, c build, cpp/c run) are always
+// stubbed to no-ops here so NewNsjailRunner never shells out to gcc/g++ during a
+// unit test. A test that exercises those profiles assigns resolveCppBuildMounts /
+// resolveCBuildMounts / resolveCppRunMounts directly after calling this helper; the
+// originals are still restored on cleanup.
+func withStubbedResolvers(t *testing.T, py3, bash, js resolverFn) {
 	t.Helper()
-	orig := resolvePy3Mounts
-	t.Cleanup(func() { resolvePy3Mounts = orig })
-	resolvePy3Mounts = fn
+	origPy3, origBash, origJs := resolvePy3Mounts, resolveBashMounts, resolveJsMounts
+	origCppBuild, origCBuild, origCppRun := resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts
+	t.Cleanup(func() {
+		resolvePy3Mounts, resolveBashMounts, resolveJsMounts = origPy3, origBash, origJs
+		resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = origCppBuild, origCBuild, origCppRun
+	})
+	noop := func(context.Context) ([]string, error) { return nil, nil }
+	if py3 == nil {
+		py3 = noop
+	}
+	if bash == nil {
+		bash = noop
+	}
+	if js == nil {
+		js = noop
+	}
+	resolvePy3Mounts, resolveBashMounts, resolveJsMounts = py3, bash, js
+	resolveCppBuildMounts, resolveCBuildMounts, resolveCppRunMounts = noop, noop, noop
 }
 
-// TestPy3MountsResolvedOnceAndReused verifies that the expensive py3 mount
-// resolution (which shells out to ldd) happens exactly once, at construction,
-// and that every subsequent request reuses the cached result rather than
-// re-resolving.
-func TestPy3MountsResolvedOnceAndReused(t *testing.T) {
-	cached := []string{
-		"--bindmount_ro", "/usr/bin/python3.11:/usr/bin/python3",
-		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
-		"--bindmount_ro", "/usr/lib/python3.11",
-	}
+// assertMountsResolvedOnceAndReused verifies that the expensive mount resolution
+// for one interpreted language (which shells out to ldd) happens exactly once, at
+// construction, and that every subsequent request for that language reuses the
+// cached result plus its own writable work dir rather than re-resolving.
+func assertMountsResolvedOnceAndReused(t *testing.T, target string, cached []string) {
+	t.Helper()
 
 	var calls int
-	withStubbedPy3Resolver(t, func(ctx context.Context) ([]string, error) {
+	stub := func(context.Context) ([]string, error) {
 		calls++
 		// Return a fresh copy so any accidental mutation by the caller cannot
 		// hide a re-resolution behind shared state.
 		return append([]string(nil), cached...), nil
-	})
+	}
+
+	switch target {
+	case pythonInterpreter:
+		withStubbedResolvers(t, stub, nil, nil)
+	case bashInterpreter:
+		withStubbedResolvers(t, nil, stub, nil)
+	case nodeInterpreter:
+		withStubbedResolvers(t, nil, nil, stub)
+	default:
+		t.Fatalf("unexpected target %q", target)
+	}
 
 	r, err := NewNsjailRunner(context.Background(), "nsjail")
 	if err != nil {
@@ -51,12 +89,12 @@ func TestPy3MountsResolvedOnceAndReused(t *testing.T) {
 		t.Fatalf("expected resolver to run once at construction, ran %d times", calls)
 	}
 
-	// Many py3 requests, each with a different work directory. None of them
-	// should trigger another resolution, and each should carry the cached
-	// read-only mounts plus its own writable work dir.
+	// Many requests, each with a different work directory. None of them should
+	// trigger another resolution, and each should carry the cached read-only
+	// mounts plus its own writable work dir.
 	for i := range 5 {
 		workDir := fmt.Sprintf("/tmp/goboxd-%d", i)
-		got := r.filesystemArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: workDir})
+		got := r.filesystemArgs(RunSpec{Cmd: target, WorkDir: workDir})
 
 		want := append(append([]string(nil), cached...), "--bindmount", workDir)
 		if !reflect.DeepEqual(got, want) {
@@ -69,55 +107,455 @@ func TestPy3MountsResolvedOnceAndReused(t *testing.T) {
 	}
 }
 
-// TestFilesystemArgsDoesNotMutateCache guards against the per-request work-dir
-// append corrupting the shared cached slice across requests.
-func TestFilesystemArgsDoesNotMutateCache(t *testing.T) {
-	cached := []string{"--bindmount_ro", "/usr/bin/python3.11:/usr/bin/python3"}
-	withStubbedPy3Resolver(t, func(ctx context.Context) ([]string, error) {
-		return append([]string(nil), cached...), nil
+// TestPy3MountsResolvedOnceAndReused covers the py3 mount cache.
+func TestPy3MountsResolvedOnceAndReused(t *testing.T) {
+	assertMountsResolvedOnceAndReused(t, pythonInterpreter, []string{
+		"--bindmount_ro", "/usr/bin/python3.11:/usr/bin/python3",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--bindmount_ro", "/usr/lib/python3.11",
 	})
+}
+
+// TestBashMountsResolvedOnceAndReused covers the bash mount cache, which (unlike
+// py3) carries only the binary and its shared libraries — no stdlib directory.
+func TestBashMountsResolvedOnceAndReused(t *testing.T) {
+	assertMountsResolvedOnceAndReused(t, bashInterpreter, []string{
+		"--bindmount_ro", "/usr/bin/bash:/usr/bin/bash",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libtinfo.so.6",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+	})
+}
+
+// TestJsMountsResolvedOnceAndReused covers the js (node) mount cache, which
+// carries the binary, its shared libraries, and Debian's externalized-builtins
+// directory (node aborts at startup without it).
+func TestJsMountsResolvedOnceAndReused(t *testing.T) {
+	assertMountsResolvedOnceAndReused(t, nodeInterpreter, []string{
+		"--bindmount_ro", "/usr/bin/node:/usr/bin/node",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libnode.so.108",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--bindmount_ro", "/usr/share/nodejs",
+	})
+}
+
+// TestFilesystemArgsDoesNotMutateCache guards against the per-request work-dir
+// append corrupting a shared cached slice across requests, for each isolated
+// language.
+func TestFilesystemArgsDoesNotMutateCache(t *testing.T) {
+	py3Cached := []string{"--bindmount_ro", "/usr/bin/python3.11:/usr/bin/python3"}
+	bashCached := []string{"--bindmount_ro", "/usr/bin/bash:/usr/bin/bash"}
+	jsCached := []string{"--bindmount_ro", "/usr/bin/nodejs:/usr/bin/node"}
+
+	copyOf := func(s []string) resolverFn {
+		return func(context.Context) ([]string, error) { return append([]string(nil), s...), nil }
+	}
+	withStubbedResolvers(t, copyOf(py3Cached), copyOf(bashCached), copyOf(jsCached))
 
 	r, err := NewNsjailRunner(context.Background(), "nsjail")
 	if err != nil {
 		t.Fatalf("NewNsjailRunner: %v", err)
 	}
 
-	r.filesystemArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/a"})
-	r.filesystemArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/b"})
-
-	if !reflect.DeepEqual(r.py3Mounts, cached) {
-		t.Fatalf("cached py3 mounts were mutated: got %v, want %v", r.py3Mounts, cached)
+	cases := []struct {
+		cmd    string
+		cached []string
+		field  []string
+	}{
+		{pythonInterpreter, py3Cached, r.py3Mounts},
+		{bashInterpreter, bashCached, r.bashMounts},
+		{nodeInterpreter, jsCached, r.jsMounts},
+	}
+	for _, c := range cases {
+		r.filesystemArgs(RunSpec{Cmd: c.cmd, WorkDir: "/tmp/a"})
+		r.filesystemArgs(RunSpec{Cmd: c.cmd, WorkDir: "/tmp/b"})
+		if !reflect.DeepEqual(c.field, c.cached) {
+			t.Fatalf("%s: cached mounts were mutated: got %v, want %v", c.cmd, c.field, c.cached)
+		}
 	}
 }
 
 // TestNewNsjailRunnerFailsLoudlyOnResolveError confirms a resolution failure at
 // startup surfaces as a construction error (so main can make it fatal) rather
-// than being deferred to the first request.
+// than being deferred to the first request — for each interpreted language.
 func TestNewNsjailRunnerFailsLoudlyOnResolveError(t *testing.T) {
-	withStubbedPy3Resolver(t, func(ctx context.Context) ([]string, error) {
-		return nil, fmt.Errorf("python3 not found")
-	})
+	fail := func(context.Context) ([]string, error) { return nil, fmt.Errorf("interpreter not found") }
 
-	if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
-		t.Fatal("expected NewNsjailRunner to return an error when py3 mounts cannot be resolved")
+	cases := []struct {
+		name          string
+		py3, bash, js resolverFn
+	}{
+		{name: "py3", py3: fail},
+		{name: "bash", bash: fail},
+		{name: "js", js: fail},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withStubbedResolvers(t, c.py3, c.bash, c.js)
+			if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+				t.Fatalf("expected NewNsjailRunner to error when %s mounts cannot be resolved", c.name)
+			}
+		})
 	}
 }
 
-// TestFilesystemArgsNonPy3Unchanged confirms non-py3 languages still get the
-// shared-host-filesystem flag and are unaffected by the py3 cache.
-func TestFilesystemArgsNonPy3Unchanged(t *testing.T) {
-	withStubbedPy3Resolver(t, func(ctx context.Context) ([]string, error) {
-		return []string{"--bindmount_ro", "/usr/bin/python3.11:/usr/bin/python3"}, nil
-	})
+// TestFilesystemArgsCompiledLanguageUnchanged confirms the languages that are
+// still on the shared filesystem get --disable_clone_newns and are unaffected by
+// the isolated-profile caches. g++, gcc and "./artifact" are deliberately
+// excluded: the cpp/c build steps and any "./artifact" run step are now isolated.
+func TestFilesystemArgsCompiledLanguageUnchanged(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
 
 	r, err := NewNsjailRunner(context.Background(), "nsjail")
 	if err != nil {
 		t.Fatalf("NewNsjailRunner: %v", err)
 	}
 
-	got := r.filesystemArgs(RunSpec{Cmd: "/usr/bin/g++", WorkDir: "/tmp/x"})
-	want := []string{"--disable_clone_newns"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("non-py3 filesystemArgs = %v, want %v", got, want)
+	// A representative sample of the still-shared commands: the Java
+	// compiler/runtime and the Verilog build/run binaries. Note g++, gcc and
+	// "./solution" are NOT here — they have their own profiles now.
+	for _, cmd := range []string{"/usr/bin/javac", "/usr/bin/java", "/usr/bin/iverilog", "/usr/bin/vvp"} {
+		got := r.filesystemArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/x"})
+		want := []string{"--disable_clone_newns"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s filesystemArgs = %v, want %v", cmd, got, want)
+		}
 	}
+}
+
+// TestCppBuildArgs verifies the g++ build step gets its cached build mounts, a
+// writable tmpfs /tmp (g++ needs scratch space for intermediate files), and the
+// per-request work directory mounted writable — in that order.
+func TestCppBuildArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	buildCache := []string{
+		"--bindmount_ro", "/usr/include",
+		"--bindmount_ro", "/usr/lib/gcc/x86_64-linux-gnu/12",
+		"--bindmount_ro", "/usr/bin/g++",
+	}
+	resolveCppBuildMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), buildCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: cppCompiler, WorkDir: "/tmp/build"})
+	want := append(append([]string(nil), buildCache...),
+		"--tmpfsmount", "/tmp",
+		"--bindmount", "/tmp/build",
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpp build filesystemArgs = %v, want %v", got, want)
+	}
+}
+
+// TestCppRunArgs verifies the compiled-artifact run step ("./solution") gets its
+// cached minimal library mounts plus the writable work directory, and crucially
+// NO tmpfs /tmp (the untrusted binary should get nothing it does not need).
+func TestCppRunArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	runCache := []string{
+		"--bindmount_ro", "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+		"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6",
+		"--bindmount_ro", "/lib64/ld-linux-x86-64.so.2",
+	}
+	resolveCppRunMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: "./solution", WorkDir: "/tmp/run"})
+	want := append(append([]string(nil), runCache...), "--bindmount", "/tmp/run")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpp run filesystemArgs = %v, want %v", got, want)
+	}
+	for _, a := range got {
+		if a == "--tmpfsmount" {
+			t.Fatalf("run step must not mount a tmpfs /tmp: %v", got)
+		}
+	}
+}
+
+// TestCppMountsResolvedOnceAndReused confirms the two cpp profiles (which shell
+// out to g++) are resolved exactly once, at construction, and reused across
+// requests with only the per-request work dir appended.
+func TestCppMountsResolvedOnceAndReused(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+
+	var buildCalls, runCalls int
+	buildCache := []string{"--bindmount_ro", "/usr/bin/g++"}
+	runCache := []string{"--bindmount_ro", "/lib/x86_64-linux-gnu/libc.so.6"}
+	resolveCppBuildMounts = func(context.Context) ([]string, error) {
+		buildCalls++
+		return append([]string(nil), buildCache...), nil
+	}
+	resolveCppRunMounts = func(context.Context) ([]string, error) {
+		runCalls++
+		return append([]string(nil), runCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("expected each cpp resolver to run once at construction, got build=%d run=%d", buildCalls, runCalls)
+	}
+
+	for i := range 5 {
+		workDir := fmt.Sprintf("/tmp/goboxd-%d", i)
+
+		gotBuild := r.filesystemArgs(RunSpec{Cmd: cppCompiler, WorkDir: workDir})
+		wantBuild := append(append([]string(nil), buildCache...), "--tmpfsmount", "/tmp", "--bindmount", workDir)
+		if !reflect.DeepEqual(gotBuild, wantBuild) {
+			t.Fatalf("build request %d: filesystemArgs = %v, want %v", i, gotBuild, wantBuild)
+		}
+
+		gotRun := r.filesystemArgs(RunSpec{Cmd: "./solution", WorkDir: workDir})
+		wantRun := append(append([]string(nil), runCache...), "--bindmount", workDir)
+		if !reflect.DeepEqual(gotRun, wantRun) {
+			t.Fatalf("run request %d: filesystemArgs = %v, want %v", i, gotRun, wantRun)
+		}
+	}
+
+	if buildCalls != 1 || runCalls != 1 {
+		t.Fatalf("cpp resolver re-ran on later requests: build=%d run=%d", buildCalls, runCalls)
+	}
+
+	// The cached slices must not have been mutated by the per-request appends.
+	if !reflect.DeepEqual(r.cppBuildMounts, buildCache) {
+		t.Fatalf("cpp build cache mutated: got %v, want %v", r.cppBuildMounts, buildCache)
+	}
+	if !reflect.DeepEqual(r.cppRunMounts, runCache) {
+		t.Fatalf("cpp run cache mutated: got %v, want %v", r.cppRunMounts, runCache)
+	}
+}
+
+// TestCBuildArgs verifies the gcc build step gets its cached build mounts, a
+// writable tmpfs /tmp (gcc, like g++, needs scratch space for intermediate files),
+// and the per-request work directory mounted writable — in that order. It mirrors
+// TestCppBuildArgs for the c build profile.
+func TestCBuildArgs(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	buildCache := []string{
+		"--bindmount_ro", "/usr/include",
+		"--bindmount_ro", "/usr/lib/gcc/x86_64-linux-gnu/12",
+		"--bindmount_ro", "/usr/bin/gcc",
+	}
+	resolveCBuildMounts = func(context.Context) ([]string, error) {
+		return append([]string(nil), buildCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	got := r.filesystemArgs(RunSpec{Cmd: cCompiler, WorkDir: "/tmp/build"})
+	want := append(append([]string(nil), buildCache...),
+		"--tmpfsmount", "/tmp",
+		"--bindmount", "/tmp/build",
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("c build filesystemArgs = %v, want %v", got, want)
+	}
+}
+
+// TestCMountsResolvedOnceAndReused confirms the c build profile (which shells out
+// to gcc) is resolved exactly once, at construction, and reused across requests
+// with only the per-request work dir appended. The c run step has no separate
+// resolver — it shares the cpp run profile — so only the build cache is checked
+// here. Mirrors TestCppMountsResolvedOnceAndReused.
+func TestCMountsResolvedOnceAndReused(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+
+	var buildCalls int
+	buildCache := []string{"--bindmount_ro", "/usr/bin/gcc"}
+	resolveCBuildMounts = func(context.Context) ([]string, error) {
+		buildCalls++
+		return append([]string(nil), buildCache...), nil
+	}
+
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("expected c build resolver to run once at construction, got %d", buildCalls)
+	}
+
+	for i := range 5 {
+		workDir := fmt.Sprintf("/tmp/goboxd-%d", i)
+		got := r.filesystemArgs(RunSpec{Cmd: cCompiler, WorkDir: workDir})
+		want := append(append([]string(nil), buildCache...), "--tmpfsmount", "/tmp", "--bindmount", workDir)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("build request %d: filesystemArgs = %v, want %v", i, got, want)
+		}
+	}
+
+	if buildCalls != 1 {
+		t.Fatalf("c build resolver re-ran on later requests: %d", buildCalls)
+	}
+	if !reflect.DeepEqual(r.cBuildMounts, buildCache) {
+		t.Fatalf("c build cache mutated: got %v, want %v", r.cBuildMounts, buildCache)
+	}
+}
+
+// TestNewNsjailRunnerFailsLoudlyOnCResolveError confirms a c build resolution
+// failure at startup surfaces as a construction error, mirroring the cpp case.
+func TestNewNsjailRunnerFailsLoudlyOnCResolveError(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	resolveCBuildMounts = func(context.Context) ([]string, error) {
+		return nil, fmt.Errorf("gcc not found")
+	}
+	if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+		t.Fatal("expected NewNsjailRunner to error when c build mounts cannot be resolved")
+	}
+}
+
+// TestParseIncludeDirs checks the header-search block is extracted from
+// `g++ -E -v` output and surrounding noise is ignored.
+func TestParseIncludeDirs(t *testing.T) {
+	out := `ignored preamble
+#include "..." search starts here:
+ /should/be/ignored/quote/path
+#include <...> search starts here:
+ /usr/include/c++/12
+ /usr/include/x86_64-linux-gnu/c++/12
+ /usr/lib/gcc/x86_64-linux-gnu/12/include
+ /usr/include
+End of search list.
+trailing noise that mentions /not/a/dir`
+
+	got := parseIncludeDirs(out)
+	want := []string{
+		"/usr/include/c++/12",
+		"/usr/include/x86_64-linux-gnu/c++/12",
+		"/usr/lib/gcc/x86_64-linux-gnu/12/include",
+		"/usr/include",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseIncludeDirs = %v, want %v", got, want)
+	}
+}
+
+// TestParseSearchDirs checks the install dir and library dirs are extracted and
+// path-cleaned from `g++ -print-search-dirs` output.
+func TestParseSearchDirs(t *testing.T) {
+	out := `install: /usr/lib/gcc/x86_64-linux-gnu/12/
+programs: =/usr/lib/gcc/x86_64-linux-gnu/12/:/usr/bin/
+libraries: =/usr/lib/gcc/x86_64-linux-gnu/12/:/usr/lib/gcc/x86_64-linux-gnu/12/../../../x86_64-linux-gnu/:/lib/x86_64-linux-gnu/:/usr/lib/`
+
+	libDirs, installDir := parseSearchDirs(out)
+	if installDir != "/usr/lib/gcc/x86_64-linux-gnu/12" {
+		t.Fatalf("installDir = %q, want %q", installDir, "/usr/lib/gcc/x86_64-linux-gnu/12")
+	}
+	want := []string{
+		"/usr/lib/gcc/x86_64-linux-gnu/12",
+		"/usr/lib/x86_64-linux-gnu",
+		"/lib/x86_64-linux-gnu",
+		"/usr/lib",
+	}
+	if !reflect.DeepEqual(libDirs, want) {
+		t.Fatalf("parseSearchDirs libDirs = %v, want %v", libDirs, want)
+	}
+}
+
+// TestMountSetDeduplicatesAndAvoidsOverlap exercises the mountSet overlap rules
+// against a real temp tree: nested directories collapse to the most specific
+// disjoint set, files inside a mounted directory are skipped, and a file outside
+// any mounted directory is bound individually.
+func TestMountSetDeduplicatesAndAvoidsOverlap(t *testing.T) {
+	root := t.TempDir()
+	mkdir := func(p string) string {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(full, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return full
+	}
+	mkfile := func(p string) string {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return full
+	}
+
+	libDir := mkdir("usr/lib")
+	libChild := mkdir("usr/lib/x86_64") // nested under libDir
+	incDir := mkdir("usr/include")      // disjoint
+	libFile := mkfile("usr/lib/libc.so")
+	binFile := mkfile("usr/bin/ld")
+
+	m := newMountSet()
+	m.addDirRO(libDir)
+	m.addDirRO(libChild) // nested → skipped
+	m.addDirRO(incDir)   // disjoint → kept
+	m.addDirRO(libDir)   // duplicate → skipped
+	m.addFileRO(libFile) // inside libDir → skipped
+	m.addFileRO(binFile) // outside any dir → kept
+
+	want := []string{
+		"--bindmount_ro", libDir,
+		"--bindmount_ro", incDir,
+		"--bindmount_ro", binFile,
+	}
+	if !reflect.DeepEqual(m.args(), want) {
+		t.Fatalf("mountSet args = %v, want %v", m.args(), want)
+	}
+}
+
+// TestMountSetAncestorReplacesDescendant checks the reverse overlap case: adding a
+// broad parent directory after a specific child is already mounted drops the child
+// and keeps the parent, because the parent mount already exposes the child (and
+// may expose sibling files the child does not). This is what makes /usr/include
+// win over /usr/include/x86_64-linux-gnu so top-level headers like features.h stay
+// reachable.
+func TestMountSetAncestorReplacesDescendant(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "usr/include/x86_64")
+	if err := os.MkdirAll(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "usr/include")
+
+	m := newMountSet()
+	m.addDirRO(child)  // specific
+	m.addDirRO(parent) // ancestor of child → replaces it
+
+	want := []string{"--bindmount_ro", parent}
+	if !reflect.DeepEqual(m.args(), want) {
+		t.Fatalf("mountSet args = %v, want %v", m.args(), want)
+	}
+}
+
+// TestNewNsjailRunnerFailsLoudlyOnCppResolveError confirms a cpp resolution
+// failure at startup surfaces as a construction error, for both cpp profiles.
+func TestNewNsjailRunnerFailsLoudlyOnCppResolveError(t *testing.T) {
+	fail := func(context.Context) ([]string, error) { return nil, fmt.Errorf("g++ not found") }
+
+	t.Run("build", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveCppBuildMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when cpp build mounts cannot be resolved")
+		}
+	})
+	t.Run("run", func(t *testing.T) {
+		withStubbedResolvers(t, nil, nil, nil)
+		resolveCppRunMounts = fail
+		if _, err := NewNsjailRunner(context.Background(), "nsjail"); err == nil {
+			t.Fatal("expected NewNsjailRunner to error when cpp run mounts cannot be resolved")
+		}
+	})
 }
