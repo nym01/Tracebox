@@ -3,11 +3,14 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/nym01/goboxd/internal/compare"
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
@@ -67,9 +70,29 @@ type TestResult struct {
 }
 
 type RunResponse struct {
+	RunID  string       `json:"run_id"`
 	Status string       `json:"status"`
 	Build  *BuildResult `json:"build,omitempty"`
 	Tests  []TestResult `json:"tests"`
+}
+
+// runLog is the structured JSON log line emitted to stdout when a run completes.
+type runLog struct {
+	RunID      string `json:"run_id"`
+	Language   string `json:"language"`
+	Status     string `json:"status"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMs int64  `json:"duration_ms"`
+	Timestamp  string `json:"timestamp"`
+}
+
+// emitRunLog writes a single structured JSON log line describing a completed run.
+func emitRunLog(l runLog) {
+	line, err := json.Marshal(l)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(os.Stdout, string(line))
 }
 
 func run(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +122,15 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lang, _ := language.Lookup(req.Language)
+
+	// run_id identifies this run in the response and structured log. Generated
+	// before any runner invocation; an RNG failure falls back to the nil UUID
+	// rather than aborting an otherwise valid run.
+	runID := "00000000-0000-0000-0000-000000000000"
+	if v, err := uuid.NewV7(); err == nil {
+		runID = v.String()
+	}
+	runStart := time.Now()
 
 	tmpDir, err := os.MkdirTemp("", "goboxd-*")
 	if err != nil {
@@ -170,9 +202,19 @@ func run(w http.ResponseWriter, r *http.Request) {
 			for i := range notExecuted {
 				notExecuted[i] = TestResult{Status: status.NotExecuted}
 			}
+			topStatus := status.TopLevel(bstatus, nil)
+			emitRunLog(runLog{
+				RunID:      runID,
+				Language:   req.Language,
+				Status:     topStatus,
+				ExitCode:   bres.ExitCode,
+				DurationMs: time.Since(runStart).Milliseconds(),
+				Timestamp:  time.Now().Format(time.RFC3339),
+			})
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RunResponse{
-				Status: status.TopLevel(bstatus, nil),
+				RunID:  runID,
+				Status: topStatus,
 				Build:  buildResult,
 				Tests:  notExecuted,
 			})
@@ -181,6 +223,10 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	testResults := make([]TestResult, len(req.Tests))
+
+	// runExitCode summarizes the run for the structured log: the first non-zero
+	// test exit code, or 0 when every test exited cleanly.
+	runExitCode := 0
 
 	for i, tc := range req.Tests {
 		cmd := resolveTokens(lang.Run.Cmd, srcFilename, artifactFilename)
@@ -204,6 +250,10 @@ func run(w http.ResponseWriter, r *http.Request) {
 		if runErr != nil {
 			testResults[i] = TestResult{Status: status.InternalError}
 			continue
+		}
+
+		if result.ExitCode != 0 && runExitCode == 0 {
+			runExitCode = result.ExitCode
 		}
 
 		var ts string
@@ -236,8 +286,17 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 	topStatus := status.TopLevel(status.BuildOK, testStatuses)
 
+	emitRunLog(runLog{
+		RunID:      runID,
+		Language:   req.Language,
+		Status:     topStatus,
+		ExitCode:   runExitCode,
+		DurationMs: time.Since(runStart).Milliseconds(),
+		Timestamp:  time.Now().Format(time.RFC3339),
+	})
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(RunResponse{Status: topStatus, Build: buildResult, Tests: testResults})
+	json.NewEncoder(w).Encode(RunResponse{RunID: runID, Status: topStatus, Build: buildResult, Tests: testResults})
 }
 
 func resolveTokens(s, sourceFile, artifactFile string) string {
