@@ -200,7 +200,7 @@ func runCode(ctx context.Context, client *http.Client, apiURL string, in runCode
 		return toolError("failed to decode API response: %v", err)
 	}
 
-	out := runCodeOutput{RunID: rr.RunID, Status: rr.Status}
+	out := runCodeOutput{RunID: rr.RunID, Status: reportedStatus(rr.Status)}
 	if rr.Build != nil && rr.Build.Status != "build_ok" {
 		out.CompileOutput = truncate(joinOutput(rr.Build.Stdout, rr.Build.Stderr), maxOutputBytes)
 	}
@@ -218,6 +218,25 @@ func runCode(ctx context.Context, client *http.Client, apiURL string, in runCode
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 	}, out, nil
+}
+
+// reportedStatus maps the API's top-level run status to what the agent sees.
+// The MCP "run this and show me the output" use case never supplies an
+// expected_stdout, so the API's output-comparison verdicts are not meaningful
+// pass/fail signals — with an empty expectation, any program that prints
+// something comes back as wrong_output (or output_whitespace_mismatch), which
+// would mislead the agent into thinking the run failed. Collapse those
+// comparison verdicts (including the trivially "accepted" empty-output case)
+// to a neutral "ran", and pass genuine execution failures
+// (runtime_error, time_exceeded, memory_exceeded, build_failed,
+// internal_error, …) through unchanged.
+func reportedStatus(apiStatus string) string {
+	switch apiStatus {
+	case "accepted", "wrong_output", "output_whitespace_mismatch":
+		return "ran"
+	default:
+		return apiStatus
+	}
 }
 
 func isSupported(lang string) bool {

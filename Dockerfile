@@ -1,9 +1,9 @@
-FROM golang:1.22 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o goboxd ./cmd/goboxd
+RUN CGO_ENABLED=0 GOOS=linux go build -o goboxd ./cmd/tracebox
 
 # Build nsjail from source (pinned to tag 3.4 via the external/nsjail submodule).
 # Do NOT bundle a prebuilt binary and do NOT install nsjail from apt — it must
