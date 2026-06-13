@@ -2,11 +2,16 @@
 
 An [MCP](https://modelcontextprotocol.io) server that exposes the Tracebox
 sandbox to AI agents (Claude Desktop, Claude Code, etc.) as a single tool,
-`run_code`. It is a **thin stdio client over the Tracebox HTTP API** — it does
+`tracebox_run`. It is a **thin stdio client over the Tracebox HTTP API** — it does
 no sandboxing itself and simply forwards each call to `POST /run` on a running
 Tracebox API server.
 
-## The `run_code` tool
+The tool is named `tracebox_run` (not `run_code`) to avoid colliding with the
+built-in `run_code` tool some clients (e.g. Claude Code) ship for notebook/IDE
+execution, which would otherwise make the client ambiguous about which tool to
+call.
+
+## The `tracebox_run` tool
 
 | Param      | Type   | Required | Description                                                        |
 | ---------- | ------ | -------- | ------------------------------------------------------------------ |
@@ -46,8 +51,13 @@ will log `serving over stdio`.
 ### Claude Code
 
 ```sh
-claude mcp add tracebox --env TRACEBOX_API_URL=http://localhost:8080 -- /absolute/path/to/tracebox-mcp
+claude mcp add tracebox --scope user --env TRACEBOX_API_URL=http://localhost:8080 -- /absolute/path/to/tracebox-mcp
 ```
+
+The `--scope user` flag registers the server for your user account so it is
+available from every directory. Without it, `claude mcp add` defaults to
+`local` scope, which only registers the server for the current working
+directory — it will then be missing whenever you launch Claude Code elsewhere.
 
 ### Claude Desktop
 
@@ -68,4 +78,4 @@ Add an entry under `mcpServers` in the config file
 ```
 
 Use an absolute path to the built binary. Restart the client after editing the
-config; `run_code` will then appear as an available tool.
+config; `tracebox_run` will then appear as an available tool.

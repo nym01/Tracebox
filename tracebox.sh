@@ -168,7 +168,14 @@ ok "Built MCP server: $MCP_PATH"
 
 # --- 6. Register the MCP server with Claude Code (if available). -----------
 step 6 "Registering the MCP server with Claude Code..."
-MCP_ADD_CMD="claude mcp add tracebox --env TRACEBOX_API_URL=$API_URL -- \"$MCP_PATH\""
+# Register at *user* scope so the server is available from every directory.
+# `claude mcp add` defaults to `local` scope, which only registers the server
+# for the current working directory; the server would then be missing whenever
+# Claude Code is launched from anywhere else. Detection and registration must
+# use the same scope, so the check below uses `claude mcp get` (which resolves
+# user-scoped servers from any directory) rather than parsing `claude mcp list`
+# (whose local-scoped entries depend on the current directory).
+MCP_ADD_CMD="claude mcp add tracebox --scope user --env TRACEBOX_API_URL=$API_URL -- \"$MCP_PATH\""
 MCP_STATUS="failed"
 if ! command -v claude >/dev/null 2>&1; then
     MCP_STATUS="skipped"
@@ -176,10 +183,12 @@ if ! command -v claude >/dev/null 2>&1; then
     info "Install Claude Code and re-run this script to enable MCP, or register manually:"
     info "    $MCP_ADD_CMD"
 else
-    if claude mcp list 2>/dev/null | grep -Eiq '^[[:space:]]*tracebox\b'; then
+    # `claude mcp get tracebox` exits 0 only when a server by that name exists;
+    # this avoids substring/format false positives from scraping list output.
+    if claude mcp get tracebox >/dev/null 2>&1; then
         MCP_STATUS="registered"
         ok "MCP server 'tracebox' is already registered - skipping."
-    elif claude mcp add tracebox --env "TRACEBOX_API_URL=$API_URL" -- "$MCP_PATH"; then
+    elif claude mcp add tracebox --scope user --env "TRACEBOX_API_URL=$API_URL" -- "$MCP_PATH"; then
         MCP_STATUS="registered"
         ok "Registered MCP server 'tracebox' with Claude Code."
     else

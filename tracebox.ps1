@@ -157,7 +157,14 @@ Write-Ok "Built MCP server: $McpPath"
 
 # --- 6. Register the MCP server with Claude Code (if available). -----------
 Write-Step 6 "Registering the MCP server with Claude Code..."
-$McpAddCmd = "claude mcp add tracebox --env TRACEBOX_API_URL=$ApiUrl -- `"$McpPath`""
+# Register at *user* scope so the server is available from every directory.
+# `claude mcp add` defaults to `local` scope, which only registers the server
+# for the current working directory; the server would then be missing whenever
+# Claude Code is launched from anywhere else. Detection and registration must
+# use the same scope, so the check below uses `claude mcp get` (which resolves
+# user-scoped servers from any directory) rather than parsing `claude mcp list`
+# (whose local-scoped entries depend on the current directory).
+$McpAddCmd = "claude mcp add tracebox --scope user --env TRACEBOX_API_URL=$ApiUrl -- `"$McpPath`""
 $McpRegistered = $false
 $McpSkipped    = $false
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
@@ -166,13 +173,14 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
     Write-Info  "Install Claude Code and re-run this script to enable MCP, or register manually:"
     Write-Info  "    $McpAddCmd"
 } else {
-    $existing = ""
-    try { $existing = (claude mcp list 2>$null | Out-String) } catch { $existing = "" }
-    if ($existing -match "(?im)^\s*tracebox\b") {
+    # `claude mcp get tracebox` exits 0 only when a server by that name exists;
+    # this avoids substring/format false positives from scraping list output.
+    claude mcp get tracebox *> $null
+    if ($LASTEXITCODE -eq 0) {
         $McpRegistered = $true
         Write-Ok "MCP server 'tracebox' is already registered - skipping."
     } else {
-        claude mcp add tracebox --env "TRACEBOX_API_URL=$ApiUrl" -- "$McpPath"
+        claude mcp add tracebox --scope user --env "TRACEBOX_API_URL=$ApiUrl" -- "$McpPath"
         if ($LASTEXITCODE -eq 0) {
             $McpRegistered = $true
             Write-Ok "Registered MCP server 'tracebox' with Claude Code."

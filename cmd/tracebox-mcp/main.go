@@ -1,5 +1,5 @@
 // Command tracebox-mcp is a Model Context Protocol (MCP) server that exposes the
-// Tracebox sandbox to AI agents as a single `run_code` tool.
+// Tracebox sandbox to AI agents as a single `tracebox_run` tool.
 //
 // It is a thin stdio client over the Tracebox HTTP API: every tool call is
 // translated into a POST /run request against the running API server. No sandbox
@@ -124,9 +124,10 @@ func main() {
 	}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "run_code",
-		Description: "Execute untrusted source code in the Tracebox sandbox and return its " +
-			"output. Supports py3, cpp, c, bash, js, java, and verilog.",
+		Name: "tracebox_run",
+		Description: "Run code in the Tracebox sandbox (isolated, resource-limited environment) " +
+			"and return its output - distinct from notebook/IDE code execution. " +
+			"Executes untrusted source code; supports py3, cpp, c, bash, js, java, and verilog.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in runCodeInput) (*mcp.CallToolResult, runCodeOutput, error) {
 		return runCode(ctx, client, apiURL, in)
 	})
