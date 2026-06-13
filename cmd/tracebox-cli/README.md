@@ -25,12 +25,29 @@ prints and whether it crashed — without it ever touching your environment.
 
 ## Build
 
+Build with the output name `tracebox` so the command reads naturally:
+
 ```sh
+# Linux / macOS
 go build -o tracebox ./cmd/tracebox-cli
+
+# Windows
+go build -o tracebox.exe ./cmd/tracebox-cli
 ```
 
-This produces a `tracebox` binary. Put it on your `PATH` to use `tracebox run`
-from anywhere.
+This produces a `tracebox` (`tracebox.exe` on Windows) binary. Put it on your
+`PATH` to use `tracebox run` from anywhere.
+
+The easiest way to do this is the install script at the repo root, which builds
+the binary and sets up your `PATH` for you:
+
+```sh
+./install.sh          # Linux / macOS
+```
+
+```powershell
+.\install.ps1         # Windows (PowerShell)
+```
 
 ## Usage
 

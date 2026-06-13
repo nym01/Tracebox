@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# CLI binary built at the repo root by install.sh (anchored so it does not
+# match the cmd/tracebox API-server directory).
+/tracebox
+
 # Test binary, built with `go test -c`
 *.test
 
