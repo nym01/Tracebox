@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/explain.ts","./src/history.ts","./src/languages.ts","./src/main.tsx","./src/monaco-setup.ts","./src/vite-env.d.ts","./src/components/codeeditor.tsx","./src/components/historypanel.tsx","./src/components/resultpanel.tsx"],"version":"5.9.3"}

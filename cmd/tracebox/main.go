@@ -92,7 +92,7 @@ func main() {
 	api.RegisterRoutes(mux)
 
 	log.Println("listening on :8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := http.ListenAndServe(":8080", api.WithCORS(mux)); err != nil {
 		log.Fatal(err)
 	}
 }
