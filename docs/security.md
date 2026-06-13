@@ -28,13 +28,18 @@ container, are simply not present.
 
 **seccomp (syscall filtering).** A deny-list blocks a specific set of syscalls
 — `ptrace`, `bpf`, `mount`/`umount2`, `kexec_load`, `init_module`/`finit_module`/
-`delete_module`, `reboot`, `swapon`/`swapoff`, `setns`, and `unshare` with
-namespace-creating flags. These are the syscalls that could be used to escape
-or undermine the other isolation mechanisms (e.g. `mount` could remount a
-read-only bind mount as read-write; `setns` could join the host's namespaces;
-`ptrace` could attach to and control another process). Everything else is
-allowed, so normal program behavior (file I/O, memory allocation, process
-creation for compilers, etc.) is unaffected.
+`delete_module`, `reboot`, `swapon`/`swapoff`, `setns`, and **all three
+user-/mount-namespace creation primitives**: `unshare`, `clone` (both filtered on
+their `CLONE_NEWUSER`/`CLONE_NEWNS` flag arguments), and `clone3` (which hides its
+flags behind a pointer seccomp cannot inspect, so it is given `ENOSYS` — making
+glibc fall back to the filtered `clone` and a direct `clone3(CLONE_NEWUSER)` fail).
+These are the syscalls that could be used to escape or undermine the other
+isolation mechanisms (e.g. `mount` could remount a read-only bind mount as
+read-write; `setns` could join the host's namespaces; `ptrace` could attach to and
+control another process; creating a new **user namespace** would hand the caller a
+full capability set inside it — see the capability note below). Everything else is
+allowed, so normal program behavior (file I/O, memory allocation, process and
+thread creation for compilers and managed runtimes, etc.) is unaffected.
 
 **cgroup v2 memory limits.** Each language has a memory limit (from
 `configs/languages.yaml`) enforced via `--cgroup_mem_max` with swap disabled,
@@ -126,7 +131,14 @@ short-lived sandboxes" usage pattern this service has.
   (`CapInh/CapPrm/CapEff/CapBnd/CapAmb = 0000000000000000`) — nsjail drops every
   capability for the child by default. `CapBnd` (the bounding set) being empty is
   the strongest part: the process can never *regain* a capability even via a
-  setuid-root binary, so it is root-without-power. Corroborated by two
+  setuid-root binary, so it is root-without-power. One caveat this rests on:
+  creating a **new user namespace** would hand the child a full capability set
+  *inside that namespace*, sidestepping the empty `CapBnd` — so this property is
+  only sound because the seccomp policy blocks every namespace-creation path
+  (`unshare`, `clone`, and `clone3`; see the seccomp section above). The red-team
+  audit (`docs/security-audit-findings.md`, Finding A) found `clone`/`clone3`
+  originally uncovered and able to regain `CAP_SYS_ADMIN`; that gap is now closed,
+  so the "capability-less" claim holds for all three syscalls. Corroborated by two
   capability-gated syscalls that are *not* on the seccomp deny-list — `chroot()`
   (needs `CAP_SYS_CHROOT`) and `sethostname()` (needs `CAP_SYS_ADMIN`) — both
   returning `EPERM` while the program runs to completion (a true capability

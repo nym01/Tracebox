@@ -21,13 +21,25 @@
 // dying — i.e. runtime_error — not as an error return it could ignore.
 //
 // NOTE on syntax: kafel comments are // and /* */ only; a leading # is reserved
-// for #define. The two #define lines below add the clone/unshare namespace flag
+// for #define. The #define lines below add the clone/unshare namespace flag
 // constants kafel has no built-in names for (values are stable kernel ABI).
 // CLONE_NEWUSER is the classic privilege-escalation primitive (a new user
 // namespace hands the caller a full capability set inside it); CLONE_NEWNS
 // creates a new mount namespace.
 #define CLONE_NEWNS    0x00020000
 #define CLONE_NEWUSER  0x10000000
+
+// clone3's amd64 syscall number. kafel's bundled syscall table (external/nsjail/
+// kafel) predates clone3, so it has no built-in name for it; a #define'd constant
+// is resolved as a custom syscall id wherever a syscall name is expected, so the
+// ERRNO block below can name it as plain `clone3`. This is amd64-specific,
+// consistent with the rest of this policy (e.g. "umount" already means the amd64
+// umount2, no. 166) and with the x86-64 deployment target.
+#define clone3         435
+
+// Note: the ERRNO(...) action below takes a literal errno number (kafel's grammar
+// requires a numeric literal there, not a #define name). The value used is 38 =
+// ENOSYS ("function not implemented") — see the comment on that rule.
 
 POLICY tracebox {
   KILL {
@@ -78,9 +90,37 @@ POLICY tracebox {
     // namespace lets the program restructure its own mounts. Other unshare flags
     // (e.g. files/fs) are harmless and stay allowed, so this is filtered on the
     // flag argument rather than blanket-killed.
-    unshare { (unshare_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 }
+    unshare { (unshare_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 },
+
+    // clone: the OTHER namespace-creation primitive. clone(CLONE_NEWUSER, ...) is
+    // interchangeable with unshare(CLONE_NEWUSER) — it hands the caller a full
+    // capability set inside a fresh user namespace — and was the gap that let
+    // sandboxed code regain CAP_SYS_ADMIN despite the unshare rule above (audit
+    // Finding A). Filtered on the same flags as unshare so it is blocked too. The
+    // remaining clone flags are NOT touched: ordinary process and thread creation
+    // (fork, pthread_create, the compilers shelling out) pass CLONE_VM/CLONE_THREAD/
+    // SIGCHLD/… but never CLONE_NEWUSER or CLONE_NEWNS, so they stay allowed —
+    // exactly the negative-control behaviour escape test 10 (fork) checks.
+    clone { (clone_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 }
+  },
+
+  // clone3: the third namespace-creation primitive, and the one a flag-filter
+  // cannot reach — clone3 passes its flags inside a struct clone_args behind a
+  // pointer, which seccomp cannot dereference, so we cannot inspect CLONE_NEWUSER
+  // the way we do for clone/unshare. KILLing clone3 outright would be wrong: glibc
+  // >= 2.34 calls clone3 first for fork/posix_spawn/pthread_create, so a hard kill
+  // would break normal multi-threaded runtimes (JVM, V8/Node). Instead we return
+  // ENOSYS (errno 38), which makes glibc transparently and permanently fall back to
+  // the classic clone syscall (the arg-filtered one above) — its built-in
+  // old-kernel path. A program that calls clone3 directly to create a user
+  // namespace just gets ENOSYS and fails; falling back to clone(CLONE_NEWUSER) is
+  // then KILLed. Either way no new user/mount namespace is created. (This action
+  // block is comma-separated from the KILL block above, per kafel grammar.)
+  ERRNO(38) {
+    clone3
   }
 }
 
-// Deny-list semantics: anything not matched by the KILL block above is allowed.
+// Deny-list semantics: anything not matched by the KILL or ERRNO blocks above is
+// allowed.
 USE tracebox DEFAULT ALLOW

@@ -86,7 +86,9 @@ the call, which nsjail surfaces as a non-zero exit, so the API reports the run a
 These tests use **C** — the only one of the seven runtimes that can issue a raw
 syscall directly (see the test-8 note). Each program prints a flushed `BEFORE`
 marker, issues the denied syscall, then prints `AFTER`; a blocked attempt shows
-`BEFORE` but never `AFTER`. All five **held**.
+`BEFORE` but never `AFTER`. All **held**. (Test 16 was added later, when the
+red-team audit's Finding A closed the `clone`/`clone3` user-namespace gap; it is
+grouped here because it targets the same kafel deny-list.)
 
 | # | Test | Attempt | Result | Outcome |
 |---|------|---------|--------|---------|
@@ -95,6 +97,7 @@ marker, issues the denied syscall, then prints `AFTER`; a blocked attempt shows
 | 8 | `TestSeccompUmount` | `umount2(getcwd())` on the work-dir bind mount | SIGSYS-killed → `runtime_error`; `"BEFORE cwd=/tmp/goboxd-…\n"`, no `AFTER` | **Held (expected)** |
 | 9 | `TestSeccompSetns` | `open(/proc/self/ns/mnt)` then `setns(fd,0)` | open succeeds (`fd=3`); `setns` SIGSYS-killed → `runtime_error`; `"BEFORE fd=3\n"`, no `AFTER` | **Held (expected)** |
 | 10 | `TestSeccompForkAllowed` | `fork()` + `waitpid()` (negative control) | child exits 7, parent prints `FORK_OK`, exit 0 → `accepted` | **Held (expected)** |
+| 16 | `TestSeccompCloneNewuserBlocked` | `clone3(CLONE_NEWUSER)` then `clone(CLONE_NEWUSER)` (audit Finding A) | `clone3` → `-1`/`ENOSYS` (`CLONE3_RET=-1 errno=38`, no namespace); `clone` SIGSYS-killed → `runtime_error`; `"BEFORE\nCLONE3_RET=-1 errno=38\n"`, no `CLONE_USERNS_OK`, no `AFTER` | **Held (expected) — Finding A closed** |
 
 ### Notes on individual tests
 
@@ -132,14 +135,30 @@ being filtered the same way is consistent with the policy living in
 `buildNsjailArgs`'s shared base args (keyed off no language branch), i.e. applied
 to every language and to both build and run steps.
 
-### No new gaps
+**Test 16 — the `clone`/`clone3` user-namespace gap, found later and now closed.**
+The original suite (tests 6-10) only exercised `unshare` for namespace creation,
+which matched the Phase 1 policy as written. The later red-team audit
+(`docs/security-audit-findings.md`, Finding A) showed `unshare` was not the only
+door: `clone(CLONE_NEWUSER)` and `clone3(.flags=CLONE_NEWUSER)` create the same
+user namespace and originally regained a **full capability set**
+(`CapEff = 000001ffffffffff`, incl. `CAP_SYS_ADMIN`) inside it — falsifying test
+14's "capabilities fully dropped" property. The fix extends the deny-list to all
+three primitives: `clone` is arg-filtered on `CLONE_NEWUSER`/`CLONE_NEWNS` exactly
+like `unshare` (SIGSYS-KILLed), and `clone3` — whose flags hide behind a pointer
+seccomp cannot read — is given `ENOSYS`, so glibc falls back to the filtered
+`clone` and a direct `clone3(CLONE_NEWUSER)` just fails. Test 16 drives both paths
+and asserts neither creates a namespace; test 10 (fork/clone negative control)
+still passes, confirming ordinary process/thread creation is untouched.
 
-Unlike Group 1's PID-namespace finding, the seccomp group surfaced nothing beyond
-what Phase 1's policy and `docs/security.md` already document: every syscall the
-deny-list names is killed, the flag-conditional `unshare` rule fires on
-`CLONE_NEWUSER` as written, and the one explicitly-allowed primitive (fork/clone)
-works. The deny-list semantics described in `configs/seccomp.policy` and the
-threat model match observed behaviour exactly.
+### No new gaps (with one later exception, now fixed)
+
+At the time Group 2 was first run, the seccomp group surfaced nothing beyond what
+Phase 1's policy and `docs/security.md` documented: every named syscall is killed,
+the flag-conditional `unshare` rule fires on `CLONE_NEWUSER`, and the one
+explicitly-allowed primitive (fork/clone) works. The one gap discovered afterward —
+`clone`/`clone3` reaching the same user namespace `unshare` was filtered for — is
+the subject of test 16 above and is now closed; the deny-list semantics in
+`configs/seccomp.policy` and the threat model again match observed behaviour.
 
 ### Regression
 

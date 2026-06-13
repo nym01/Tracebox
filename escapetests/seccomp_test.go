@@ -223,3 +223,157 @@ int main(void){
 		t.Errorf("expected accepted for an allowed syscall, got %q; stdout=%q", run.Status, run.Stdout)
 	}
 }
+
+// Test 16 — clone / clone3 cannot create a new user namespace (audit Finding A).
+//
+// Background: the deny-list filtered user-/mount-namespace creation only on the
+// `unshare` syscall. But clone(CLONE_NEWUSER, …) and clone3(.flags=CLONE_NEWUSER)
+// create exactly the same namespace, and a new user namespace hands the caller a
+// FULL capability set (CapEff/CapPrm/CapBnd = 0x1ffffffffff, including
+// CAP_SYS_ADMIN) inside it — falsifying the "capability-less, CapBnd empty"
+// property test 14 relies on. The red-team audit demonstrated this live: a C
+// program calling clone(CLONE_NEWUSER) read a non-empty CapEff from the child's
+// /proc/self/status. This test reproduces that gap and asserts it is now closed.
+//
+// The fix (configs/seccomp.policy):
+//   - clone is arg-filtered on clone_flags exactly like unshare: a call requesting
+//     CLONE_NEWUSER (or CLONE_NEWNS) is SIGSYS-KILLed. Ordinary process/thread
+//     creation, which never sets those flags, stays allowed (test 10 still passes).
+//   - clone3 hides its flags behind a struct pointer seccomp cannot dereference, so
+//     it cannot be arg-filtered. It is given ERRNO(ENOSYS) instead of KILL, which
+//     makes glibc fall back to the (filtered) clone syscall and makes a direct
+//     clone3(CLONE_NEWUSER) simply fail with ENOSYS — no namespace either way.
+//
+// The program probes both paths in one run:
+//   (1) clone3(CLONE_NEWUSER) via raw syscall — must FAIL with ENOSYS, not return a
+//       child holding capabilities (CLONE3_USERNS_OK would be the escape).
+//   (2) clone(CLONE_NEWUSER|SIGCHLD) — must be SIGSYS-KILLed, so the process dies
+//       here: neither CLONE_USERNS_OK (the child ran with regained caps) nor the
+//       trailing AFTER marker may appear, and the run is runtime_error.
+//
+// Holds (expected): BEFORE prints; clone3 returns -1/ENOSYS (CLONE3_RET=-1 ...
+// errno=38), so no user namespace; then clone is KILLed — no CLONE_USERNS_OK, no
+// AFTER, run status runtime_error.
+//
+// Did NOT hold (ESCAPE): either CLONE3_USERNS_OK or CLONE_USERNS_OK prints (a user
+// namespace was created and the child reported a non-empty capability set), or
+// AFTER prints (clone returned instead of being killed).
+func TestSeccompCloneNewuserBlocked(t *testing.T) {
+	const src = `
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sched.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#ifndef __NR_clone3
+#define __NR_clone3 435
+#endif
+
+/* Minimal clone_args, declared locally so the test does not depend on the host's
+   <linux/sched.h> carrying struct clone_args. */
+struct tb_clone_args {
+    unsigned long long flags;
+    unsigned long long pidfd;
+    unsigned long long child_tid;
+    unsigned long long parent_tid;
+    unsigned long long exit_signal;
+    unsigned long long stack;
+    unsigned long long stack_size;
+    unsigned long long tls;
+};
+
+/* Read this task's CapEff line from /proc/self/status (no trailing newline). */
+static void read_capeff(char *buf, size_t n) {
+    buf[0] = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "CapEff:", 7) == 0) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+            snprintf(buf, n, "%s", line);
+            break;
+        }
+    }
+    fclose(f);
+}
+
+/* clone(2) child: reaching here means CLONE_NEWUSER succeeded — the escape. */
+static int child_fn(void *arg) {
+    char cap[256];
+    read_capeff(cap, sizeof(cap));
+    printf("CLONE_USERNS_OK %s\n", cap);
+    fflush(stdout);
+    return 0;
+}
+
+int main(void) {
+    printf("BEFORE\n");
+    fflush(stdout);
+
+    /* (1) clone3(CLONE_NEWUSER) via raw syscall. */
+    struct tb_clone_args ca;
+    memset(&ca, 0, sizeof(ca));
+    ca.flags = 0x10000000ULL; /* CLONE_NEWUSER */
+    ca.exit_signal = SIGCHLD;
+    long c3 = syscall(__NR_clone3, &ca, sizeof(ca));
+    if (c3 == 0) {
+        /* Child of a successful clone3 — user namespace was created (escape). */
+        char cap[256];
+        read_capeff(cap, sizeof(cap));
+        printf("CLONE3_USERNS_OK %s\n", cap);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("CLONE3_RET=%ld errno=%d\n", c3, errno);
+    fflush(stdout);
+
+    /* (2) clone(CLONE_NEWUSER|SIGCHLD) — expected to be SIGSYS-killed here. */
+    char *stack = malloc(1 << 20);
+    if (!stack) { printf("MALLOC_FAIL\n"); return 1; }
+    pid_t pid = clone(child_fn, stack + (1 << 20), CLONE_NEWUSER | SIGCHLD, NULL);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    printf("AFTER clone=%d\n", pid);
+    fflush(stdout);
+    return 0;
+}
+`
+	resp := runC(t, src, "")
+	build := resp.Build
+	run := resp.Tests[0]
+	t.Logf("clone-newuser: build=%s run=%s stdout=%q stderr=%q", build.Status, run.Status, run.Stdout, run.Stderr)
+
+	if build.Status != "ok" {
+		t.Fatalf("clone-newuser: C build did not succeed (status %q, stderr %q) — cannot conclude anything", build.Status, build.Stderr)
+	}
+	if !strings.Contains(run.Stdout, "BEFORE") {
+		t.Errorf("program did not reach the BEFORE marker — the kill is unproven; stdout=%q stderr=%q", run.Stdout, run.Stderr)
+	}
+	// The headline escape: a new user namespace was created and the child reported
+	// its (now non-empty) capability set. Either marker means Finding A is open.
+	if strings.Contains(run.Stdout, "CLONE3_USERNS_OK") {
+		t.Errorf("ESCAPE: clone3(CLONE_NEWUSER) created a user namespace — child regained capabilities; stdout=%q", run.Stdout)
+	}
+	if strings.Contains(run.Stdout, "CLONE_USERNS_OK") {
+		t.Errorf("ESCAPE: clone(CLONE_NEWUSER) created a user namespace — child regained capabilities; stdout=%q", run.Stdout)
+	}
+	// clone3 must have been refused with ENOSYS (errno 38), proving the ENOSYS
+	// fallback rule fired rather than clone3 succeeding.
+	if !strings.Contains(run.Stdout, "CLONE3_RET=-1") || !strings.Contains(run.Stdout, "errno=38") {
+		t.Errorf("clone3(CLONE_NEWUSER) was not refused with ENOSYS as expected; stdout=%q", run.Stdout)
+	}
+	// clone(CLONE_NEWUSER) must have been SIGSYS-killed, so AFTER never prints and
+	// the run is runtime_error.
+	if strings.Contains(run.Stdout, "AFTER") {
+		t.Errorf("ESCAPE: clone(CLONE_NEWUSER) returned instead of being killed — the arg-filter did not block it; stdout=%q", run.Stdout)
+	}
+	if run.Status != "runtime_error" {
+		t.Errorf("expected run status runtime_error (SIGSYS kill at clone), got %q; stdout=%q stderr=%q", run.Status, run.Stdout, run.Stderr)
+	}
+}
