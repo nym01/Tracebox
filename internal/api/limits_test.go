@@ -154,6 +154,44 @@ func TestEffectiveLimitsPartialOverride(t *testing.T) {
 	}
 }
 
+// TestEffectiveLimitsCPUMsPerSec covers the cgroup CPU-bandwidth field
+// (cpu_ms_per_sec): like the other limits it falls back to the default when the
+// request omits it, is honoured when the request asks for a tighter value, and is
+// capped at the default when the request asks for a looser (larger) one — clients
+// may only ever tighten resource limits, never loosen them.
+func TestEffectiveLimitsCPUMsPerSec(t *testing.T) {
+	base := language.Limits{WallTimeS: 9, MemoryKB: 102400, MaxProcesses: 100, CPUMsPerSec: 2000}
+	cases := []struct {
+		name string
+		req  language.Limits
+		want language.Limits
+	}{
+		{
+			name: "omitted — keeps default",
+			req:  language.Limits{WallTimeS: 3},
+			want: language.Limits{WallTimeS: 3, MemoryKB: 102400, MaxProcesses: 100, CPUMsPerSec: 2000},
+		},
+		{
+			name: "lower — honoured",
+			req:  language.Limits{CPUMsPerSec: 500},
+			want: language.Limits{WallTimeS: 9, MemoryKB: 102400, MaxProcesses: 100, CPUMsPerSec: 500},
+		},
+		{
+			name: "higher — capped at default",
+			req:  language.Limits{CPUMsPerSec: 8000},
+			want: language.Limits{WallTimeS: 9, MemoryKB: 102400, MaxProcesses: 100, CPUMsPerSec: 2000},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveLimits(base, &PhaseConfig{Limits: &tc.req})
+			if got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---- handler-level tests that verify limits flow through to the runner ----
 
 // py3 default run wall_time_s is 9 (from configs/languages.yaml).

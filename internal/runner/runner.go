@@ -27,6 +27,17 @@ type RunSpec struct {
 	// is. The count includes every task in the sandbox's cgroup (the run's own
 	// process plus any children/threads it spawns).
 	MaxProcesses int
+	// CPUMsPerSec is the CPU bandwidth limit for the run, in milliseconds of CPU
+	// time the sandbox may use per wall-clock second (1000 == one core, 2000 == two
+	// cores). Zero means "no explicit limit". SubprocessRunner ignores this field;
+	// NsjailRunner enforces it as a cgroup v2 cpu.max limit via
+	// --cgroup_cpu_ms_per_sec. Like MaxProcesses, exceeding it does not kill the
+	// process: the kernel simply *throttles* the cgroup (its tasks are scheduled for
+	// at most CPUMsPerSec ms of CPU per second), so a CPU-spinner does less useless
+	// work but is otherwise unaffected — it is the wall-time limit, not this one,
+	// that ultimately ends a spinner. The point is bounding the per-request CPU draw
+	// so concurrent requests cannot saturate every host core (CPU-exhaustion DoS).
+	CPUMsPerSec int
 }
 
 // RunResult holds what came back from the subprocess.

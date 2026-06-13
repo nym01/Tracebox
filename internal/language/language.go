@@ -4,6 +4,14 @@ type Limits struct {
 	WallTimeS    int `json:"wall_time_s,omitempty"`
 	MemoryKB     int `json:"memory_kb,omitempty"`
 	MaxProcesses int `json:"max_processes,omitempty"`
+	// CPUMsPerSec is the cgroup v2 CPU bandwidth limit, in milliseconds of CPU
+	// time the whole sandbox may consume per wall-clock second. 1000 == one full
+	// core, 2000 == two cores, etc. Zero means "no explicit limit". It is the CPU
+	// counterpart to MemoryKB/MaxProcesses: wall_time_s bounds *elapsed* time but
+	// not CPU *consumed*, so a request spinning many threads can saturate every
+	// host core for its whole wall window; this caps the per-request CPU draw so
+	// concurrent requests cannot amplify into a host-wide CPU-exhaustion DoS.
+	CPUMsPerSec int `json:"cpu_ms_per_sec,omitempty"`
 }
 
 type BuildConfig struct {

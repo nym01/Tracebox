@@ -356,7 +356,7 @@ func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
 	// path defaults to /sys/fs/cgroup, which is correct under --cgroupns=host. It is
 	// emitted once if EITHER cgroup limit is in force (memory or process-count), since
 	// both flow through the same v2 backend and nsjail only needs the flag once.
-	if spec.MemoryKB > 0 || spec.MaxProcesses > 0 {
+	if spec.MemoryKB > 0 || spec.MaxProcesses > 0 || spec.CPUMsPerSec > 0 {
 		args = append(args, "--use_cgroupv2")
 	}
 	if spec.MemoryKB > 0 {
@@ -389,6 +389,28 @@ func (r NsjailRunner) buildNsjailArgs(spec RunSpec, wallSec int) []string {
 	// assertions.
 	if spec.MaxProcesses > 0 {
 		args = append(args, "--cgroup_pids_max", strconv.Itoa(spec.MaxProcesses))
+	}
+
+	// CPU-bandwidth enforcement via a cgroup v2 cpu.max limit. nsjail writes
+	// cpu.max = "<CPUMsPerSec*1000> 1000000" on the child's cgroup (see
+	// external/nsjail/cgroup2.cc initNsFromParentCpu), i.e. the cgroup may use
+	// CPUMsPerSec milliseconds of CPU in every 1-second (1000000 µs) period —
+	// CPUMsPerSec/1000 cores' worth. This is the third resource limit alongside
+	// memory.max and pids.max, and the counterpart to the wall-time limit:
+	// --time_limit bounds ELAPSED time, but a request running its full pids.max of
+	// busy threads can pin every host core for that whole window, and with the
+	// server's NumCPU-wide concurrency cap (internal/api/concurrency.go) a handful
+	// of such requests can saturate the box (audit Finding C). Capping per-request
+	// CPU bandwidth bounds that draw so concurrent requests cannot amplify into a
+	// host-wide CPU-exhaustion DoS. Unlike memory.max, exceeding it does NOT kill the
+	// child: the kernel just THROTTLES the cgroup, so normal short-lived compiles/
+	// runs (which use little sustained CPU and finish well within the wall limit) are
+	// untouched, while a CPU-spinner simply does less useless work and is still ended
+	// by the wall-time limit (→ time_exceeded), exactly as before. Applied uniformly
+	// (keyed only off spec.CPUMsPerSec, no per-language branch) to both build and run
+	// steps; skipped when no limit is set (CPUMsPerSec == 0).
+	if spec.CPUMsPerSec > 0 {
+		args = append(args, "--cgroup_cpu_ms_per_sec", strconv.Itoa(spec.CPUMsPerSec))
 	}
 
 	// Seccomp syscall filter, applied UNIFORMLY to every language. The kafel

@@ -312,6 +312,110 @@ int main(void){
 	}
 }
 
+// Test 18 — CPU-exhaustion bound (max CPU bandwidth, audit Finding C).
+//
+// This test targets CPU draw, the resource the first three pillars do not bound.
+// --time_limit bounds ELAPSED time, memory.max bounds resident memory, pids.max
+// bounds task count — but none bounds CPU CONSUMED, so a single request running its
+// full pids.max of busy threads could pin every host core for its whole wall window,
+// and with the server's NumCPU-wide concurrency cap a handful of such requests could
+// saturate the box (a noisy-neighbour / availability DoS, not an isolation breach).
+//
+// The fix: a per-request cgroup v2 cpu.max limit, configured via
+// --cgroup_cpu_ms_per_sec (configs/languages.yaml cpu_ms_per_sec; c's run step gets
+// 2000 = two cores). RunSpec carries CPUMsPerSec, handlers.go plumbs it, and
+// buildNsjailArgs emits the flag; the vendored nsjail writes "<ms*1000> 1000000" to
+// the child cgroup's cpu.max (external/nsjail/cgroup2.cc initNsFromParentCpu).
+//
+// What is and is not observable here. The cap's PRIMARY effect — limiting how many
+// host cores a request can consume — is not visible through the /run HTTP API (the
+// response carries duration_ms, not CPU-seconds), so it is verified by the unit
+// tests (TestCgroupCpuLimit* in internal/runner) plus nsjail's cpu.max write. What
+// this black-box test verifies is the two things that MUST hold end-to-end:
+//   (1) the cap does not break the safety/timeout path — a multi-threaded CPU
+//       spinner is still cleanly bounded (time_exceeded) and the service survives
+//       (cpu.max THROTTLES rather than kills, so the wall limit is what ends it);
+//   (2) the cap does not cause FALSE POSITIVES — a normal, finite, compute-light
+//       program still completes 'accepted', not a spurious time_exceeded from being
+//       throttled below what legitimate work needs.
+//
+// Holds (expected): the spinner returns time_exceeded; a trivial run afterwards
+// succeeds; and the positive-control program returns accepted.
+//
+// Did NOT hold: the spinner crashes/hangs the service, or the positive control is
+// throttled into time_exceeded (the cap is set too low and breaks normal work).
+func TestCpuExhaustionBound(t *testing.T) {
+	// A multi-threaded busy spinner: more threads than any plausible core count, each
+	// in a tight volatile loop, so without a CPU cap it would pin every host core for
+	// the full wall window. glibc >= 2.34 (bookworm) puts pthread_* in libc, so no
+	// -pthread link flag is needed (the c build flag allow-list permits none anyway).
+	const spinSrc = `
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+static void *spin(void *arg){ volatile unsigned long x=0; for(;;){ x++; } return 0; }
+int main(void){
+    printf("SPIN_START\n"); fflush(stdout);
+    pthread_t th[16];
+    for (int i=0;i<16;i++) pthread_create(&th[i], 0, spin, 0);
+    for (int i=0;i<16;i++) pthread_join(th[i], 0); /* never returns: wall limit ends us */
+    printf("SPIN_DONE\n"); fflush(stdout);
+    return 0;
+}
+`
+	resp := runC(t, spinSrc, "")
+	build := resp.Build
+	run := resp.Tests[0]
+	t.Logf("cpu spinner: build=%s run=%s dur=%dms stdout=%q stderr=%q",
+		build.Status, run.Status, run.DurationMs, run.Stdout, run.Stderr)
+	if build.Status != "ok" {
+		t.Fatalf("cpu spinner: C build did not succeed (status %q, stderr %q)", build.Status, build.Stderr)
+	}
+	// The spinner must be bounded by the wall limit (the cpu cap throttles but does
+	// not kill, so time_exceeded is the expected terminal state) — not a crash, not a
+	// hang. A SPIN_DONE would mean the infinite loops somehow returned (impossible);
+	// the point is that the run terminates cleanly as time_exceeded.
+	if strings.Contains(run.Stdout, "SPIN_DONE") {
+		t.Errorf("cpu spinner returned from infinite loops — unexpected; stdout=%q", run.Stdout)
+	}
+	if run.Status != "time_exceeded" {
+		t.Errorf("expected the CPU spinner to be bounded as time_exceeded, got %q (cpu.max throttles, wall limit ends it); stdout=%q stderr=%q",
+			run.Status, run.Stdout, run.Stderr)
+	}
+
+	// Containment: the service must survive a CPU-saturation attempt.
+	after := runPy3(t, "print('alive')")
+	if !strings.Contains(after.Stdout, "alive") {
+		t.Errorf("CONTAINMENT FAILURE: service did not survive the CPU spinner (follow-up status %q, stdout %q)",
+			after.Status, after.Stdout)
+	} else {
+		t.Logf("containment OK: service responsive after the CPU spinner")
+	}
+
+	// Positive control: a finite, single-threaded, compute-light program must NOT be
+	// throttled into a false time_exceeded by the CPU cap. py3's cap is 1000 (one
+	// core) and this loop is single-threaded, so it runs at full speed and finishes
+	// well within py3's 9 s wall limit.
+	const controlSrc = `
+total = 0
+for i in range(5_000_000):
+    total += i
+print(total, flush=True)
+`
+	control := submit(t, runRequest{
+		Language: "py3",
+		Source:   controlSrc,
+		Tests:    []testCase{{Stdin: "", ExpectedStdout: "12499997500000\n"}},
+	}).Tests[0]
+	t.Logf("cpu positive control: status=%s dur=%dms stdout=%q", control.Status, control.DurationMs, control.Stdout)
+	if control.Status == "time_exceeded" {
+		t.Errorf("FALSE POSITIVE: a normal finite compute was throttled into time_exceeded — the CPU cap is set too low; dur=%dms", control.DurationMs)
+	}
+	if control.Status != "accepted" {
+		t.Errorf("positive control: expected accepted, got %q; stdout=%q", control.Status, control.Stdout)
+	}
+}
+
 // fmtSscanCreated extracts N from a string beginning "FORK_FAILED created=N". Kept
 // tiny and local; avoids pulling fmt.Sscanf semantics into the assertion inline.
 func fmtSscanCreated(s string, out *int) (int, error) {

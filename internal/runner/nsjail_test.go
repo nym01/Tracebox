@@ -1074,6 +1074,110 @@ func TestCgroupPidsLimitOmittedWhenUnset(t *testing.T) {
 	}
 }
 
+// TestCgroupCpuLimitPassedToNsjail verifies the cgroup v2 CPU-bandwidth limit is
+// wired into the nsjail args from spec.CPUMsPerSec: --use_cgroupv2 is present,
+// --cgroup_cpu_ms_per_sec carries the value verbatim (a ms-of-CPU-per-second count,
+// NOT scaled like the memory limit's KB→bytes — nsjail itself converts it to the
+// cpu.max "<ms*1000> 1000000" form), and both appear before the "--" separator so
+// they configure nsjail rather than being handed to the sandboxed command.
+func TestCgroupCpuLimitPassedToNsjail(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	const cpuMs = 2000 // two cores' worth (cpp/c/js/verilog budget)
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", CPUMsPerSec: cpuMs}, 10)
+
+	if !hasFlag(args, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 missing from nsjail args: %v", args)
+	}
+	got, ok := flagValue(args, "--cgroup_cpu_ms_per_sec")
+	if !ok {
+		t.Fatalf("--cgroup_cpu_ms_per_sec missing from nsjail args: %v", args)
+	}
+	if want := strconv.Itoa(cpuMs); got != want {
+		t.Fatalf("--cgroup_cpu_ms_per_sec = %q, want %q (raw ms/sec, not scaled)", got, want)
+	}
+
+	sep := slices.Index(args, "--")
+	if sep < 0 {
+		t.Fatalf("no \"--\" separator in args: %v", args)
+	}
+	if idx := slices.Index(args, "--cgroup_cpu_ms_per_sec"); idx > sep {
+		t.Fatalf("--cgroup_cpu_ms_per_sec (idx %d) appears after \"--\" (idx %d)", idx, sep)
+	}
+}
+
+// TestCgroupCpuLimitAppliedToEveryLanguage confirms the CPU-bandwidth limit is
+// uniform: every language's command variant (build and run steps alike) gets
+// --cgroup_cpu_ms_per_sec when its spec carries a CPUMsPerSec, with no per-language
+// exemption (mirrors the seccomp, memory and pids uniformity tests).
+func TestCgroupCpuLimitAppliedToEveryLanguage(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	commands := map[string]string{
+		"py3":           pythonInterpreter,
+		"bash":          bashInterpreter,
+		"js":            nodeInterpreter,
+		"cpp build":     cppCompiler,
+		"c build":       cCompiler,
+		"compiled run":  "./solution",
+		"java build":    javacCompiler,
+		"java run":      javaRuntime,
+		"verilog build": iverilogCompiler,
+		"verilog run":   vvpRuntime,
+	}
+	for name, cmd := range commands {
+		t.Run(name, func(t *testing.T) {
+			args := r.buildNsjailArgs(RunSpec{Cmd: cmd, WorkDir: "/tmp/work", CPUMsPerSec: 1000}, 10)
+			got, ok := flagValue(args, "--cgroup_cpu_ms_per_sec")
+			if !ok {
+				t.Fatalf("%s: --cgroup_cpu_ms_per_sec missing: %v", cmd, args)
+			}
+			if want := strconv.Itoa(1000); got != want {
+				t.Fatalf("%s: --cgroup_cpu_ms_per_sec = %q, want %q", cmd, got, want)
+			}
+		})
+	}
+}
+
+// TestCgroupCpuLimitOmittedWhenUnset confirms that with no CPU limit set
+// (CPUMsPerSec == 0) no --cgroup_cpu_ms_per_sec flag is emitted, and — when the
+// other cgroup limits are also unset — no cgroup backend is requested at all.
+func TestCgroupCpuLimitOmittedWhenUnset(t *testing.T) {
+	withStubbedResolvers(t, nil, nil, nil)
+	r, err := NewNsjailRunner(context.Background(), "nsjail")
+	if err != nil {
+		t.Fatalf("NewNsjailRunner: %v", err)
+	}
+
+	// Memory limit only, no CPU limit: --cgroup_cpu_ms_per_sec must be absent, but the
+	// cgroup backend is still on for the memory limit.
+	args := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: 65536}, 10)
+	if hasFlag(args, "--cgroup_cpu_ms_per_sec") {
+		t.Fatalf("expected no --cgroup_cpu_ms_per_sec when CPUMsPerSec is 0, got: %v", args)
+	}
+
+	// CPU limit only: the backend must be requested for it (it no longer depends on
+	// the memory/pids branches).
+	cpuOnly := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", CPUMsPerSec: 1000}, 10)
+	if !hasFlag(cpuOnly, "--use_cgroupv2") {
+		t.Fatalf("--use_cgroupv2 missing when only CPUMsPerSec is set: %v", cpuOnly)
+	}
+
+	// No limits at all: no cgroup flags.
+	none := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work"}, 10)
+	if hasFlag(none, "--use_cgroupv2") || hasFlag(none, "--cgroup_cpu_ms_per_sec") {
+		t.Fatalf("expected no cgroup flags when no limit is set, got: %v", none)
+	}
+}
+
 // TestCgroupUseCgroupv2EmittedOnce verifies the shared --use_cgroupv2 flag is
 // emitted exactly once regardless of which cgroup limits are in force: it must
 // appear when only the pids limit is set (the memory branch no longer owns it), and
@@ -1092,16 +1196,17 @@ func TestCgroupUseCgroupv2EmittedOnce(t *testing.T) {
 		t.Fatalf("--use_cgroupv2 missing when only MaxProcesses is set: %v", pidsOnly)
 	}
 
-	// Both limits — the flag must appear exactly once.
-	both := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: 65536, MaxProcesses: 64}, 10)
+	// All three limits (memory + pids + cpu) — the flag must still appear exactly
+	// once; the three controllers share the single v2 backend.
+	all := r.buildNsjailArgs(RunSpec{Cmd: pythonInterpreter, WorkDir: "/tmp/work", MemoryKB: 65536, MaxProcesses: 64, CPUMsPerSec: 2000}, 10)
 	count := 0
-	for _, a := range both {
+	for _, a := range all {
 		if a == "--use_cgroupv2" {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Fatalf("--use_cgroupv2 should appear exactly once, got %d: %v", count, both)
+		t.Fatalf("--use_cgroupv2 should appear exactly once, got %d: %v", count, all)
 	}
 }
 

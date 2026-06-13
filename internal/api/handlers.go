@@ -180,6 +180,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			WallTimeSec:  wallSec,
 			MemoryKB:     buildLimits.MemoryKB,
 			MaxProcesses: buildLimits.MaxProcesses,
+			CPUMsPerSec:  buildLimits.CPUMsPerSec,
 		})
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
@@ -246,6 +247,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			WallTimeSec:  wallSec,
 			MemoryKB:     runLimits.MemoryKB,
 			MaxProcesses: runLimits.MaxProcesses,
+			CPUMsPerSec:  runLimits.CPUMsPerSec,
 		})
 		if runErr != nil {
 			testResults[i] = TestResult{Status: status.InternalError}
@@ -346,6 +348,12 @@ func effectiveLimits(base language.Limits, override *PhaseConfig) language.Limit
 			v = base.MaxProcesses
 		}
 		base.MaxProcesses = v
+	}
+	if v := override.Limits.CPUMsPerSec; v > 0 {
+		if base.CPUMsPerSec > 0 && v > base.CPUMsPerSec {
+			v = base.CPUMsPerSec
+		}
+		base.CPUMsPerSec = v
 	}
 	return base
 }

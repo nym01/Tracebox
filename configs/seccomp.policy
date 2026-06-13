@@ -37,6 +37,20 @@
 // umount2, no. 166) and with the x86-64 deployment target.
 #define clone3         435
 
+// io_uring's three amd64 syscall numbers. kafel's bundled syscall table also
+// predates io_uring (Linux 5.1), so — like clone3 — these have no built-in names
+// and are #define'd as custom syscall ids for the ERRNO block below. io_uring is a
+// modern async-I/O interface whose submitted operations (read/write/openat/connect/
+// …) execute on KERNEL worker threads, not as syscalls from the sandboxed task, so
+// a per-task seccomp filter cannot see them — it is both a large kernel attack
+// surface (a prolific source of LPE CVEs) and a latent channel that could end-run
+// any future tightening of this deny-list (audit Finding B). io_uring_setup is the
+// entry point that creates a ring; io_uring_enter submits/waits and
+// io_uring_register pins buffers/files to an existing ring.
+#define io_uring_setup    425
+#define io_uring_enter    426
+#define io_uring_register 427
+
 // Note: the ERRNO(...) action below takes a literal errno number (kafel's grammar
 // requires a numeric literal there, not a #define name). The value used is 38 =
 // ENOSYS ("function not implemented") — see the comment on that rule.
@@ -104,20 +118,44 @@ POLICY tracebox {
     clone { (clone_flags & (CLONE_NEWUSER | CLONE_NEWNS)) != 0 }
   },
 
+  // ERRNO(38) = ENOSYS ("function not implemented"). Syscalls here are denied by
+  // making the kernel report them as unimplemented, rather than KILLing the task.
+  // ENOSYS is the right action for syscalls that a legitimate runtime might *probe*
+  // and gracefully fall back from: a KILL would turn that probe into a fatal SIGSYS,
+  // a guaranteed regression, whereas ENOSYS denies the capability while leaving the
+  // runtime free to use its fallback path.
+  //
   // clone3: the third namespace-creation primitive, and the one a flag-filter
   // cannot reach — clone3 passes its flags inside a struct clone_args behind a
   // pointer, which seccomp cannot dereference, so we cannot inspect CLONE_NEWUSER
   // the way we do for clone/unshare. KILLing clone3 outright would be wrong: glibc
   // >= 2.34 calls clone3 first for fork/posix_spawn/pthread_create, so a hard kill
-  // would break normal multi-threaded runtimes (JVM, V8/Node). Instead we return
-  // ENOSYS (errno 38), which makes glibc transparently and permanently fall back to
-  // the classic clone syscall (the arg-filtered one above) — its built-in
-  // old-kernel path. A program that calls clone3 directly to create a user
-  // namespace just gets ENOSYS and fails; falling back to clone(CLONE_NEWUSER) is
-  // then KILLed. Either way no new user/mount namespace is created. (This action
-  // block is comma-separated from the KILL block above, per kafel grammar.)
+  // would break normal multi-threaded runtimes (JVM, V8/Node). ENOSYS instead makes
+  // glibc transparently and permanently fall back to the classic clone syscall (the
+  // arg-filtered one above) — its built-in old-kernel path. A program that calls
+  // clone3 directly to create a user namespace just gets ENOSYS and fails; falling
+  // back to clone(CLONE_NEWUSER) is then KILLed. Either way no new user/mount
+  // namespace is created.
+  //
+  // io_uring_setup / io_uring_enter / io_uring_register: deny io_uring (audit
+  // Finding B). ENOSYS is chosen over KILL for the same reason as clone3: io_uring
+  // is feature-probed by modern runtimes — notably libuv >= 1.45 (Node) attempts
+  // io_uring_setup for file I/O and silently falls back to the thread-pool path when
+  // it fails — so a KILL would risk a fatal SIGSYS on a future toolchain bump, while
+  // ENOSYS looks exactly like a kernel without io_uring (the documented fallback
+  // trigger). The current image (Debian bookworm: Node 18 / libuv 1.44, plus
+  // python3/bash/gcc/g++/javac/java/iverilog/vvp) does not call io_uring at all, so
+  // there is no behavioural change today; ENOSYS keeps it that way across upgrades.
+  // Crucially, denying io_uring_setup means no ring is ever created, which closes
+  // both halves of the finding: the io_uring kernel attack surface, and the
+  // kernel-thread I/O channel that a per-task seccomp filter cannot otherwise see.
+  // (This action block is comma-separated from the KILL block above, per kafel
+  // grammar.)
   ERRNO(38) {
-    clone3
+    clone3,
+    io_uring_setup,
+    io_uring_enter,
+    io_uring_register
   }
 }
 

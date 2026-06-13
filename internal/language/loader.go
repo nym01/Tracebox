@@ -11,6 +11,7 @@ type yamlLimits struct {
 	WallTimeS    int `yaml:"wall_time_s"`
 	MemoryKB     int `yaml:"memory_kb"`
 	MaxProcesses int `yaml:"max_processes"`
+	CPUMsPerSec  int `yaml:"cpu_ms_per_sec"`
 }
 
 type yamlBuildConfig struct {
@@ -79,6 +80,7 @@ func LoadRegistry(path string) error {
 					WallTimeS:    yl.Run.Limits.WallTimeS,
 					MemoryKB:     yl.Run.Limits.MemoryKB,
 					MaxProcesses: yl.Run.Limits.MaxProcesses,
+					CPUMsPerSec:  yl.Run.Limits.CPUMsPerSec,
 				},
 			},
 		}
@@ -91,6 +93,7 @@ func LoadRegistry(path string) error {
 					WallTimeS:    yl.Build.Limits.WallTimeS,
 					MemoryKB:     yl.Build.Limits.MemoryKB,
 					MaxProcesses: yl.Build.Limits.MaxProcesses,
+					CPUMsPerSec:  yl.Build.Limits.CPUMsPerSec,
 				},
 			}
 		}

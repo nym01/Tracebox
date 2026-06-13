@@ -289,3 +289,144 @@ for pid in (2, 100, 1000):
 		}
 	}
 }
+
+// Test 19 — single-file disk write is bounded; bulk disk-fill is a documented
+// limitation (audit Finding D).
+//
+// The per-request work dir is a host-backed bind mount (os.MkdirTemp under the
+// container's /tmp, bind-mounted writable). It MUST be host-backed because build and
+// run are separate nsjail invocations that share state through it — the compiler
+// writes the artifact in the build step and the run step executes it — so it cannot
+// be swapped for a size-limited tmpfs without re-architecting the build/run split.
+// And a true per-request disk quota (loop-mounted fs / project quotas) is
+// disproportionate here. So Finding D's disk-fill DoS is, in the general (many-file)
+// case, a DOCUMENTED KNOWN LIMITATION (see docs/security-audit-findings.md), with the
+// recommended operational mitigation of sizing/monitoring the container's /tmp.
+//
+// What IS already enforced, and what this test verifies, is the SINGLE-FILE bound:
+// nsjail's default rlimit_fsize (1 MiB) caps the size of any one file, so a program
+// cannot write an arbitrarily large single file — the write past 1 MiB raises EFBIG
+// or the process is SIGXFSZ-terminated, either way bounding the file. The test writes
+// to ONE growing file and asserts it never reaches an obviously-large size, and that
+// the service survives. It deliberately does NOT exercise the many-small-files path
+// (that would actually fill disk); that residual is the documented limitation.
+//
+// Holds (expected): the program is cut off well before writing a large file (no
+// "MiB=64" etc.), and a trivial run afterwards still succeeds.
+//
+// Did NOT hold: the program reports writing a very large single file (rlimit_fsize
+// is not in force), or the service does not survive.
+func TestSingleFileWriteBounded(t *testing.T) {
+	// Append 256 KiB chunks to a single file in the work dir, flushing to the kernel
+	// each time, and report cumulative size. rlimit_fsize (1 MiB default) should stop
+	// it near 1 MiB — either via OSError(EFBIG) caught here, or by SIGXFSZ terminating
+	// the process (Python installs no handler), which surfaces as runtime_error. Either
+	// way the single file is bounded.
+	const src = `
+import os
+chunk = b'x' * (256 * 1024)
+total = 0
+try:
+    with open('big.bin', 'wb') as f:
+        for _ in range(8192):  # would be 2 GiB if unbounded
+            f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+            total += len(chunk)
+            if total % (1024 * 1024) == 0:
+                print('MiB=%d' % (total // (1024 * 1024)), flush=True)
+    print('DONE total_bytes=%d' % total, flush=True)
+except Exception as e:
+    print('WRITE_ERR after_bytes=%d %s' % (total, type(e).__name__), flush=True)
+`
+	res := runPy3(t, src)
+	t.Logf("single-file write: status=%s stdout=%q stderr=%q", res.Status, lastLines(res.Stdout, 3), res.Stderr)
+
+	// The decisive assertion: a single file must NOT grow large. With rlimit_fsize at
+	// 1 MiB the program is cut off near 1 MiB, so anything from ~64 MiB up means the
+	// per-file cap is not in force — the disk-fill exposure would then be far worse
+	// than the documented (file-count-only) residual.
+	for _, big := range []string{"MiB=64", "MiB=128", "MiB=256", "MiB=512", "MiB=1024"} {
+		if strings.Contains(res.Stdout, big) {
+			t.Errorf("single-file write reached %s — rlimit_fsize is not bounding single files; stdout-tail=%q", big, lastLines(res.Stdout, 3))
+		}
+	}
+	if strings.Contains(res.Stdout, "DONE total_bytes=") {
+		// Completing the full 2 GiB loop would mean no per-file bound at all.
+		t.Errorf("the write loop completed — a single file was not bounded by rlimit_fsize; stdout-tail=%q", lastLines(res.Stdout, 3))
+	}
+
+	// Containment: the service survives the write attempt.
+	after := runPy3(t, "print('alive')")
+	if !strings.Contains(after.Stdout, "alive") {
+		t.Errorf("CONTAINMENT FAILURE: service did not survive the disk-write attempt (status %q, stdout %q)", after.Status, after.Stdout)
+	} else {
+		t.Logf("containment OK: service responsive after the disk-write attempt")
+	}
+}
+
+// Test 20 — /proc leaks host facts: a DOCUMENTED KNOWN LIMITATION (audit Finding F).
+//
+// /proc is mounted (read-only) in the sandbox, and several files there are NOT
+// namespaced, so they reflect the HOST: /proc/cpuinfo (CPU model/cores),
+// /proc/meminfo (total/free RAM), /proc/loadavg (host load — a low-bandwidth
+// co-tenant side channel) and /proc/version (kernel version, useful for picking a
+// kernel exploit). This is an information-disclosure / fingerprinting issue, not an
+// isolation breach: nothing here lets sandboxed code read, write or affect anything
+// outside its sandbox.
+//
+// It is documented rather than fixed because masking these files cannot be done
+// reliably without risking runtime breakage: the JVM and V8/Node read /proc/cpuinfo
+// (and the JVM may consult /proc/meminfo) for ergonomic sizing of thread pools and
+// heaps, so feeding them a fake or empty file risks mis-sizing or startup failure
+// across the seven runtimes. The clean fix is a stronger sandbox that synthesises
+// /proc (gVisor) — see docs/security.md "Strengthening the boundary". See
+// docs/security-audit-findings.md Finding F for the full per-file reasoning.
+//
+// This test is therefore like test 12 (the zero-page boundary): it DOCUMENTS the
+// current behaviour rather than asserting a fix. It reads the four files and logs
+// what leaks; it does NOT fail on the leak (that is the known, accepted state). It
+// only fails if the behaviour changes in a way worth noticing — e.g. /proc is no
+// longer mounted at all (which would break tests 2 and 5 that rely on it) — so that a
+// future change to /proc handling does not pass silently.
+func TestProcHostInfoLeak(t *testing.T) {
+	const src = `
+def first_line(p):
+    try:
+        with open(p) as f:
+            return f.readline().strip()
+    except Exception as e:
+        return 'ERR ' + type(e).__name__
+
+def field(p, key):
+    try:
+        with open(p) as f:
+            for line in f:
+                if line.startswith(key):
+                    return line.strip()
+    except Exception as e:
+        return 'ERR ' + type(e).__name__
+    return 'ABSENT'
+
+print('CPUINFO', field('/proc/cpuinfo', 'model name'), flush=True)
+print('MEMINFO', field('/proc/meminfo', 'MemTotal'), flush=True)
+print('LOADAVG', first_line('/proc/loadavg'), flush=True)
+print('VERSION', first_line('/proc/version'), flush=True)
+`
+	res := runPy3(t, src)
+	t.Logf("proc leak: status=%s\n%s", res.Status, res.Stdout)
+
+	// /proc must still be mounted (tests 2 and 5 depend on it); a wholesale ERR on
+	// every file would mean /proc handling changed and those tests' premises shifted.
+	if strings.Contains(res.Stdout, "CPUINFO ERR") && strings.Contains(res.Stdout, "VERSION ERR") {
+		t.Errorf("/proc appears unmounted (every probe errored) — this changes the premise of tests 2 and 5; stdout=%q", res.Stdout)
+	}
+
+	// Document (do not fail) which host facts are visible. These leaks are the known
+	// limitation; logging them keeps the current state on the record.
+	for _, label := range []string{"CPUINFO model name", "MEMINFO MemTotal", "LOADAVG", "VERSION Linux"} {
+		if strings.Contains(res.Stdout, label) {
+			t.Logf("KNOWN LIMITATION (Finding F): host fact visible via /proc — %q", label)
+		}
+	}
+}

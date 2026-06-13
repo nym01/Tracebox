@@ -377,3 +377,99 @@ int main(void) {
 		t.Errorf("expected run status runtime_error (SIGSYS kill at clone), got %q; stdout=%q stderr=%q", run.Status, run.Stdout, run.Stderr)
 	}
 }
+
+// Test 17 — io_uring cannot be set up (audit Finding B).
+//
+// Background: io_uring (syscalls 425-427) is a modern async-I/O interface whose
+// submitted operations execute on KERNEL worker threads, not as syscalls from the
+// sandboxed task — so a per-task seccomp filter cannot see them. The audit found it
+// fully available (a C program got "IO_URING_OK fd=3"): a large kernel attack
+// surface (a prolific LPE-CVE source) and a latent channel that could end-run any
+// future tightening of the deny-list. This test reproduces that probe and asserts
+// it is now closed.
+//
+// The fix (configs/seccomp.policy): io_uring_setup/enter/register are denied with
+// ENOSYS (errno 38), NOT KILL — the same treatment as clone3, and for the same
+// reason. ENOSYS is chosen because modern runtimes feature-probe io_uring (libuv
+// >= 1.45 attempts io_uring_setup and falls back to its thread pool on failure), so
+// a KILL would risk a fatal SIGSYS on a future toolchain bump, whereas ENOSYS looks
+// exactly like a kernel without io_uring (the documented fallback trigger). Because
+// io_uring_setup itself is denied, no ring is ever created, which closes both halves
+// of the finding: the io_uring kernel surface and the kernel-thread I/O channel.
+//
+// Unlike the KILL tests above (6-9), the program is NOT killed: it runs to
+// completion. So the shape mirrors clone3 in test 16 — io_uring_setup returns
+// -1/ENOSYS, the program prints its result and reaches AFTER.
+//
+// Holds (expected): BEFORE prints; io_uring_setup returns -1 with errno 38
+// (IO_URING_DENIED ret=-1 errno=38), so no ring fd; AFTER prints; the run is NOT a
+// SIGSYS kill. No "IO_URING_OK" anywhere.
+//
+// Did NOT hold (ESCAPE): "IO_URING_OK fd=…" prints — io_uring_setup returned a real
+// ring fd, so the io_uring machinery is reachable by untrusted code.
+func TestSeccompIoUringBlocked(t *testing.T) {
+	const src = `
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup 425
+#endif
+
+/* io_uring_setup(unsigned entries, struct io_uring_params *p) returns a ring fd.
+   struct io_uring_params is 120 bytes on x86-64; over-size the buffer to 256 so a
+   (hypothetical) SUCCESS would not corrupt the stack when the kernel writes the
+   sq/cq offsets back — we want a clean IO_URING_OK in the escape case, not a crash
+   that masks it. */
+int main(void){
+    printf("BEFORE\n");
+    fflush(stdout);
+
+    unsigned char params[256];
+    memset(params, 0, sizeof(params));
+    long fd = syscall(__NR_io_uring_setup, 8u, params);
+    if (fd >= 0) {
+        printf("IO_URING_OK fd=%ld\n", fd);
+    } else {
+        printf("IO_URING_DENIED ret=%ld errno=%d\n", fd, errno);
+    }
+    fflush(stdout);
+
+    printf("AFTER\n");
+    fflush(stdout);
+    return 0;
+}
+`
+	resp := runC(t, src, "")
+	build := resp.Build
+	run := resp.Tests[0]
+	t.Logf("io_uring: build=%s run=%s stdout=%q stderr=%q", build.Status, run.Status, run.Stdout, run.Stderr)
+
+	if build.Status != "ok" {
+		t.Fatalf("io_uring: C build did not succeed (status %q, stderr %q) — cannot conclude anything", build.Status, build.Stderr)
+	}
+	if !strings.Contains(run.Stdout, "BEFORE") {
+		t.Errorf("program did not reach the BEFORE marker; stdout=%q stderr=%q", run.Stdout, run.Stderr)
+	}
+	// The headline escape: io_uring_setup returned a real ring fd.
+	if strings.Contains(run.Stdout, "IO_URING_OK") {
+		t.Errorf("ESCAPE: io_uring_setup created a ring (Finding B still open) — io_uring is reachable by untrusted code; stdout=%q", run.Stdout)
+	}
+	// It must have been refused with ENOSYS (errno 38), proving the ENOSYS rule fired
+	// rather than io_uring_setup succeeding.
+	if !strings.Contains(run.Stdout, "IO_URING_DENIED") || !strings.Contains(run.Stdout, "errno=38") {
+		t.Errorf("io_uring_setup was not refused with ENOSYS as expected; stdout=%q", run.Stdout)
+	}
+	// ENOSYS is a graceful denial, not a kill: the program must run PAST the call to
+	// print AFTER (a SIGSYS kill would stop before it), so the run is NOT runtime_error.
+	if !strings.Contains(run.Stdout, "AFTER") {
+		t.Errorf("program did not reach AFTER — io_uring was denied by a kill rather than the intended ENOSYS; stdout=%q stderr=%q", run.Stdout, run.Stderr)
+	}
+	if run.Status == "runtime_error" {
+		t.Errorf("expected a clean completion (ENOSYS fallback, not a SIGSYS kill), got runtime_error; stdout=%q stderr=%q", run.Stdout, run.Stderr)
+	}
+}

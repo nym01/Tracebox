@@ -15,11 +15,11 @@ Where a finding was cheap and non-destructive to verify, it was run against the
 | # | Finding | Class | Verified |
 |---|---------|-------|----------|
 | **A** | `clone(CLONE_NEWUSER)` / `clone3` bypass the `unshare(CLONE_NEWUSER)` deny rule → **full capability set regained inside the sandbox** | **FIXED** (was POTENTIAL REAL GAP, high) | **fix verified live** |
-| **B** | `io_uring` fully available (not on the deny-list) — kernel attack surface + a syscall channel that runs work on kernel threads, bypassing seccomp | **POTENTIAL REAL GAP** | **yes, live** |
-| C | No `cpu.max`/cpuset limit → CPU exhaustion amplified by `pids.max` threads × `NumCPU` concurrency | POTENTIAL REAL GAP (DoS) | reasoned |
-| D | Per-request work dir is bind-mounted writable with **no size quota** → disk-fill DoS | POTENTIAL REAL GAP (DoS) | reasoned |
-| E | Every "interpreted" runtime can load a native `.so` from the writable work dir → the escape-suite premise that "only C can issue raw syscalls" is false; findings A/B are reachable from all 7 languages | THEORETICAL → amplifier | partially live |
-| F | `/proc` leaks host CPU model, total RAM, loadavg, kernel version (not namespaced) | THEORETICAL / LOW-MED (info leak + co-tenant side channel) | **yes, live** |
+| **B** | `io_uring` fully available (not on the deny-list) — kernel attack surface + a syscall channel that runs work on kernel threads, bypassing seccomp | **FIXED** (was POTENTIAL REAL GAP) | fix unit-tested; live test 17 added |
+| **C** | No `cpu.max`/cpuset limit → CPU exhaustion amplified by `pids.max` threads × `NumCPU` concurrency | **FIXED** (was POTENTIAL REAL GAP, DoS) | fix unit-tested; live test 18 added |
+| **D** | Per-request work dir is bind-mounted writable with **no size quota** → disk-fill DoS | **DOCUMENTED KNOWN LIMITATION** (single-file bound enforced; bulk fill residual) | reasoned; live test 19 added |
+| E | Every "interpreted" runtime can load a native `.so` from the writable work dir → the escape-suite premise that "only C can issue raw syscalls" is false; findings A/B are reachable from all 7 languages | **ADDRESSED** (doc correction) | partially live |
+| **F** | `/proc` leaks host CPU model, total RAM, loadavg, kernel version (not namespaced) | **DOCUMENTED KNOWN LIMITATION** (info leak + side channel; no breach) | **yes, live**; test 20 added |
 | G | Build step's `#include "/proc/..."` can echo host info into compiler diagnostics | THEORETICAL / LOW | reasoned |
 
 Finding **A** is the headline: it directly falsifies a claim the current threat
@@ -176,7 +176,12 @@ how Docker's default profile handles `clone3`) and breaks nothing.
 
 ---
 
-## B. `io_uring` is fully available — **[verified live]**
+## B. `io_uring` is fully available — **[FIXED]**
+
+> **STATUS: FIXED.** The seccomp policy now denies all three io_uring syscalls
+> (`io_uring_setup`/`io_uring_enter`/`io_uring_register`) with `ENOSYS`, so no ring
+> can be created. See **"The fix"** at the end of this section. The original gap
+> analysis below is retained for the record.
 
 ### The gap
 
@@ -212,9 +217,60 @@ bucket, not individually verified but reachable by the same reasoning:
 `perf_event_open` (LPE history; gated by `perf_event_paranoid`), `add_key` /
 `keyctl` / `request_key`. None are on the deny-list.
 
+### The fix
+
+Implemented in `configs/seccomp.policy` (kafel), staying with the Phase-1 deny-list
+approach. `io_uring_setup` (425), `io_uring_enter` (426) and `io_uring_register`
+(427) are added to the **`ERRNO(38)` (ENOSYS)** block — the same action and the same
+reasoning as `clone3`, **not** the KILL block. kafel's bundled syscall table predates
+io_uring, so the three numbers are `#define`d as custom syscall ids exactly as
+`clone3` already is.
+
+**Why `ENOSYS`, not `KILL`.** ENOSYS makes the kernel report the syscall as
+unimplemented — indistinguishable from running on a kernel without io_uring, which is
+precisely the condition modern runtimes are written to fall back from. libuv ≥ 1.45
+(Node) probes `io_uring_setup` for file I/O and silently reverts to its thread-pool
+path when it fails; a hard KILL would turn that probe into a fatal SIGSYS on a future
+toolchain bump, a latent regression. On the **current** image (Debian bookworm: Node
+18 / libuv 1.44, plus python3/bash/gcc/g++/javac/java/iverilog/vvp) nothing calls
+io_uring at all, so there is no behavioural change today; ENOSYS keeps it that way
+across upgrades. This mirrors how container runtimes treat probe-and-fallback
+syscalls and is consistent with the existing `clone3` rule.
+
+**Why this fully closes the finding.** Both halves of the gap hinge on a ring
+existing. Denying `io_uring_setup` means no ring is ever created, so there is no
+io_uring kernel machinery for untrusted code to reach (the LPE attack surface) and no
+ring through which I/O could be submitted to kernel worker threads (the
+seccomp-bypass channel). `io_uring_enter`/`register` are denied too as
+belt-and-suspenders; without a ring fd they are unreachable anyway.
+
+The adjacent syscalls noted above (`userfaultfd`, `perf_event_open`, `keyctl`, …)
+remain a deny-list residual — the inherent property of a deny-list, already flagged
+as a known limitation in `docs/security.md`. They are out of scope for this fix,
+which targets the specific, verified io_uring exposure.
+
+### Verification
+
+- **New escape test 17** (`escapetests/seccomp_test.go`,
+  `TestSeccompIoUringBlocked`): a C program issues `io_uring_setup` via raw syscall.
+  Pre-fix it printed `IO_URING_OK fd=3`; post-fix it must print
+  `IO_URING_DENIED ret=-1 errno=38` (no ring), then run **past** the call to `AFTER`
+  (ENOSYS is a graceful denial, not a SIGSYS kill — so, unlike tests 6-9, the run is
+  not `runtime_error`). `IO_URING_OK` must not appear.
+- **Unit:** the policy is handed to nsjail for every language by the existing
+  `TestSeccompPolicyPassedToNsjailForEveryLanguage`; no per-language branch, so the
+  io_uring rule applies uniformly.
+- **Languages:** none of the seven call io_uring on the current image, so all seven
+  still build and run normally (the ENOSYS choice guarantees no breakage even if a
+  future runtime starts probing it).
+
 ---
 
-## C. No CPU limit → CPU-exhaustion DoS amplified by threads × concurrency
+## C. No CPU limit → CPU-exhaustion DoS amplified by threads × concurrency — **[FIXED]**
+
+> **STATUS: FIXED.** Each run now carries a per-request cgroup v2 `cpu.max` limit,
+> sized per language in `configs/languages.yaml`. See **"The fix"** at the end of
+> this section.
 
 `buildNsjailArgs` sets `--time_limit` (wall clock) and a cgroup `pids.max`, but
 **no `cpu.max` and no cpuset** (`--max_cpus`). Wall-time bounds *elapsed* time,
@@ -237,9 +293,70 @@ service stays responsive — mirrors the fork-bomb test 13. Not run here to avoi
 loading the shared host. Fix direction (later): a per-request `cpu.max` quota
 and/or cpuset.
 
+### The fix
+
+A per-request cgroup v2 **`cpu.max`** limit, wired exactly like the existing
+`memory.max` and `pids.max` limits:
+
+1. **nsjail flag.** nsjail 3.4 has `--cgroup_cpu_ms_per_sec N`: it writes
+   `cpu.max = "<N*1000> 1000000"` on the child's cgroup
+   (`external/nsjail/cgroup2.cc` `initNsFromParentCpu`), i.e. the cgroup may use *N*
+   milliseconds of CPU in each 1-second period — *N*/1000 cores' worth. (Checked the
+   vendored source for the exact flag name and behaviour rather than assuming; there
+   is no separate cpuset flag, and cpuset is not needed — bandwidth throttling is
+   what bounds the DoS.)
+2. **Config + plumbing.** A new `cpu_ms_per_sec` field on the per-step `limits` in
+   `configs/languages.yaml` flows through `language.Limits` → `effectiveLimits`
+   (clamped so a request can only *tighten* it, like the others) →
+   `runner.RunSpec.CPUMsPerSec` → `buildNsjailArgs`, which emits
+   `--cgroup_cpu_ms_per_sec` and turns on `--use_cgroupv2`. Applied uniformly to every
+   language and to both the build and run steps.
+3. **Values and reasoning.** py3/bash run = 1000 (1 core); cpp/c (build+run),
+   js run, verilog (build+run) = 2000 (2 cores); java (build+run) = 4000 (4 cores,
+   the most thread-parallel runtime: JIT + GC). The key property that makes these safe
+   is that **`cpu.max` throttles, it does not kill**: a value set "too low" can only
+   ever *slow* a program, never change its result. Normal compiles/runs use little
+   *sustained* CPU and finish well within `wall_time_s`, so the cap never bites them —
+   only a CPU-spinner is throttled, and it is still ended by the wall limit
+   (→ `time_exceeded`), exactly as before. The values are therefore sized generously
+   (≥ 1 core, 4 for the JVM) to leave **zero** risk of a false `time_exceeded` on
+   legitimate multi-threaded startup, while still bounding each request to a few cores
+   so that `pids.max` threads × `NumCPU` concurrency can no longer multiply into a
+   host-wide CPU-exhaustion DoS.
+
+Why a per-request bandwidth cap rather than a global one: the amplification is
+*per request* (one request × up to `pids.max` busy threads), and the server already
+caps concurrency at `NumCPU`, so bounding each request to *k* cores bounds total CPU
+demand at *k* × `NumCPU` instead of `min(pids.max, NumCPU)` × `NumCPU`.
+
+### Verification
+
+- **New escape test 18** (`escapetests/cgroup_test.go`, `TestCpuExhaustionBound`):
+  a 16-thread C busy-spinner is cleanly bounded (`time_exceeded`, not a crash/hang)
+  and the service stays responsive afterward; a finite single-threaded py3 compute
+  (the positive control) still returns `accepted`, proving the cap does not throttle
+  normal work into a false `time_exceeded`. (The cap's *primary* effect — limiting
+  host cores consumed — is not observable through the HTTP API, so it is covered by
+  the unit tests below plus nsjail's `cpu.max` write.)
+- **Unit:** `TestCgroupCpuLimitPassedToNsjail`,
+  `TestCgroupCpuLimitAppliedToEveryLanguage`, `TestCgroupCpuLimitOmittedWhenUnset`
+  and an extended `TestCgroupUseCgroupv2EmittedOnce` (all in
+  `internal/runner/nsjail_test.go`), plus `TestEffectiveLimitsCPUMsPerSec`
+  (`internal/api/limits_test.go`) for the tighten-only clamp.
+- **Languages / escape tests 1-17:** `go build ./...`, `go vet ./...`,
+  `go test ./...` and `go vet -tags escapetests ./escapetests/...` all pass; the
+  generous per-language values mean no normal build/run is throttled into a false
+  failure.
+
 ---
 
-## D. Writable work dir has no size quota → disk-fill DoS
+## D. Writable work dir has no size quota → disk-fill DoS — **[DOCUMENTED KNOWN LIMITATION]**
+
+> **STATUS: DOCUMENTED KNOWN LIMITATION (partial mitigation in place).** The
+> *single-file* case is already bounded by nsjail's default `rlimit_fsize` (1 MiB);
+> the *many-files* bulk-fill case has no proportionate code fix given the
+> architecture, so it is documented with an operational mitigation. See **"The
+> determination"** at the end of this section.
 
 The per-request work dir is `os.MkdirTemp("", "goboxd-*")`
 (`internal/api/handlers.go`), i.e. under the container's `/tmp` (overlay/disk,
@@ -266,9 +383,75 @@ takes nsjail's small default size and is torn down with the mount namespace.
 disk) — describe, don't run. Fix direction: size-limit the work-dir mount / set a
 disk quota, or set an explicit small `rlimit_fsize` *and* cap inode/file count.
 
+### The determination
+
+Investigated both fix options the finding lists and concluded a proportionate code
+fix for the *general* (many-files) case is not available without re-architecting,
+so this is documented as a known limitation with a partial mitigation already in
+force and a recommended operational mitigation.
+
+**Why a size-limited tmpfs work dir does not fit.** The work dir cannot be swapped
+for a `--mount none:DST:tmpfs:size=N` mount, because **build and run are separate
+nsjail invocations that share state through this directory**: the compiler writes
+the artifact (`./solution`, `*.vvp`, `*.class`) in the build step and the run step —
+a *different* nsjail process — executes it. A per-invocation tmpfs would be empty in
+the run step, so the artifact would vanish between build and run. The directory must
+be a host-backed bind mount for that hand-off to work. (For the interpreted
+languages the source file is likewise written to the host dir by the Go server
+*before* nsjail starts, so it too must be a host bind mount to be visible.) A tmpfs
+would also charge writes against `memory.max` rather than disk, conflating two
+limits — which the finding explicitly warns against.
+
+**Why a per-request disk quota is over-engineering.** A real per-request quota needs
+either a loop-mounted filesystem of fixed size per request (mkfs + mount/umount per
+request — heavyweight, and the mount syscalls are seccomp-killed inside the sandbox,
+so it would have to be orchestrated by the server) or project/user quotas on the
+backing filesystem (filesystem-type-dependent, needs quota tooling in the image).
+Both are disproportionate to a DoS-class (not isolation-breach) finding.
+
+**What IS already enforced (the partial mitigation).** nsjail's default
+`rlimit_fsize` of **1 MiB** caps the size of any *single* file: a write past 1 MiB
+returns `EFBIG`, or the writer is `SIGXFSZ`-terminated. So the unbounded-*single-file*
+variant is already closed — verified by **new escape test 19**
+(`TestSingleFileWriteBounded`): a program appending to one file never reaches a large
+size and the service survives. The residual is purely the **create-many-1-MiB-files**
+loop, whose total is unbounded by any rlimit. Per-request `os.RemoveAll` reclaims the
+dir after each request, and concurrency is `NumCPU`-bounded, so the pressure is
+transient and bounded in *width*, just not in per-request *total*.
+
+**Recommended operational mitigation (document, deploy-side).** Bound the blast
+radius at the container, where it is cheap and effective:
+
+- Mount the container's `/tmp` (where the work dirs live) as a **size-limited
+  tmpfs**, e.g. `docker run --tmpfs /tmp:size=512m …` or a sized volume. A fill then
+  hits the tmpfs cap and the offending request's writes fail — it cannot reach the
+  host disk, and other tenants are unaffected once that request is reaped. (Sizing
+  `/tmp` as tmpfs also makes the disk pressure charge to container memory, which is
+  itself bounded by the container's memory limit.)
+- Independently, **monitor/alert on host (and container) disk usage** and keep the
+  per-request `os.RemoveAll` cleanup (already present) so leaked dirs cannot
+  accumulate.
+
+This mirrors the threat model's overall stance: the strong per-request isolation is
+in the sandbox, and a few availability concerns are addressed operationally at the
+container boundary (the same place `--privileged` and concurrency live).
+
 ---
 
-## E. "Interpreted" languages can reach raw syscalls too (threat-model correction)
+## E. "Interpreted" languages can reach raw syscalls too (threat-model correction) — **[ADDRESSED]**
+
+> **STATUS: ADDRESSED (documentation).** This was a documentation correction, not a
+> code gap. `docs/security.md`'s seccomp section already treats the deny-list as the
+> uniform backstop for *every* language (it carries no "only C can issue syscalls"
+> claim), and a sentence has been added there making explicit that any runtime can
+> load a native `.so` from the writable work dir — so seccomp, not mount minimalism,
+> is what backstops findings A/B across all seven languages. The narrower per-test
+> note in `docs/escape-tests.md` (test 8) is about the *mount* syscalls specifically
+> being unreachable from the interpreted languages' *built-in* facilities (py3 has no
+> ctypes), which remains true and is left as-is; the broader "raw syscalls via a
+> loaded `.so`" point is what this finding corrects, and that now lives in
+> `docs/security.md`.
+
 
 `docs/escape-tests.md` repeatedly asserts C is "the only one of the seven runtimes
 that can issue a raw syscall directly," and that py3 in particular can't (ctypes is
@@ -302,7 +485,14 @@ mount/seccomp layers.
 
 ---
 
-## F. `/proc` leaks host facts and a co-tenant side channel — **[verified live]**
+## F. `/proc` leaks host facts and a co-tenant side channel — **[DOCUMENTED KNOWN LIMITATION]**
+
+> **STATUS: DOCUMENTED KNOWN LIMITATION.** Masking the non-namespaced `/proc`
+> entries cannot be done reliably without risking runtime breakage (the JVM and
+> V8/Node read `/proc/cpuinfo`, and the JVM may read `/proc/meminfo`, for ergonomic
+> sizing), and the exposure is an info-leak, not a breach. So it is documented with
+> per-file reasoning and the recommended stronger fix (gVisor). See **"The
+> determination"** at the end of this section.
 
 `/proc` is mounted (read-only) in the sandbox. Several files are **not**
 namespaced and reflect the host:
@@ -330,6 +520,54 @@ absent.
 **Class:** THEORETICAL / LOW-to-MEDIUM (info leak + side channel; no direct
 breach). **Testability:** trivial, done above. Fix direction (later): mask the
 non-namespaced `/proc` entries or run with a hardened proc view.
+
+### The determination
+
+Investigated masking these entries (nsjail can overlay individual files via
+`--bindmount_ro fake:/proc/<file>`, or drop procfs entirely with `--disable_proc`)
+and concluded a reliable, non-breaking mask is not available across the seven
+runtimes, so this is documented as a known limitation. The exposure is information
+disclosure / fingerprinting / a low-bandwidth side channel — **no read, write, or
+control of anything outside the sandbox** — so the cost/benefit does not favour a
+risky runtime-compatibility change. Per file:
+
+- **`/proc/version`** (kernel version string): nothing in any of the seven runtimes
+  reads it for behaviour. *Safe* to mask in principle — but on its own it is the
+  lowest-value leak, and masking it alone does not change the threat (the kernel
+  version is also inferable from syscall behaviour and `uname`, which is not
+  filtered).
+- **`/proc/loadavg`** (and `/proc/stat`): the side-channel surface. Nothing needs it
+  functionally, so it is *maskable*, but a static fake does not remove the channel
+  cleanly (other timing/`/proc/meminfo` signals remain) and it is the lowest-severity
+  part of the finding.
+- **`/proc/cpuinfo`** (CPU model + core count): **risky to mask.** V8/Node
+  (`os.cpus()`, libuv) and the JVM read it to size thread pools / GC and JIT
+  parallelism; a fake or empty file can yield a zero/!wrong core count and mis-size
+  or, in some runtimes, fail. This is the file most likely to break a runtime.
+- **`/proc/meminfo`** (total/free RAM): **risky to mask.** In a container the JVM
+  prefers cgroup limits for heap ergonomics, but HotSpot still consults
+  `/proc/meminfo` on some paths, and other tools read it; a fake value risks
+  mis-sized heaps. Left intact for the same compatibility reason.
+
+A *partial* mask (only `version` + `loadavg`, leaving `cpuinfo`/`meminfo`) is
+possible and safe, but it removes only the two lowest-value leaks while leaving the
+two that actually aid exploit selection (CPU/kernel fingerprint) and co-tenant
+sizing — so it is not worth the added mount complexity and the per-file fake-content
+maintenance. The clean, complete fix is a sandbox that *synthesises* `/proc` rather
+than masking files one by one — **gVisor**, already named in `docs/security.md`
+"Strengthening the boundary" as the next step up from a shared-kernel sandbox. Under
+gVisor the Sentry presents its own `/proc`, closing this entire class without
+per-file fakes. Recommended operational mitigation in the meantime: treat host CPU /
+RAM / kernel version as known-to-untrusted-code (they aid exploit selection but are
+not themselves a breach), and rely on the kernel-correctness boundary the threat
+model already names.
+
+**Verification:** new escape test 20 (`escapetests/filesystem_test.go`,
+`TestProcHostInfoLeak`) reads the four files and logs which host facts are visible,
+documenting the current behaviour (like test 12's zero-page boundary). It does not
+fail on the leak — it only fails if `/proc` stops being mounted at all, which would
+change the premise of tests 2 and 5, so a future change to `/proc` handling cannot
+pass silently.
 
 ---
 
@@ -430,20 +668,31 @@ Recording the negatives so the discussion knows they were looked at, not skipped
 
 ---
 
-## Suggested follow-ups (not done — for discussion)
+## Suggested follow-ups — status
 
-These are *findings to triage*, deliberately not implemented (this was read-only):
+The original triage list, updated with what was done:
 
-1. **A (clone userns)** — highest priority; it falsifies a stated control. Decide
-   between sysctl (`max_user_namespaces=0` in the container) vs. seccomp changes
-   (deny `clone3`, arg-filter `clone`'s `CLONE_NEW*`). Add escape test 16.
-2. **B (io_uring)** — add `io_uring_setup`/`io_uring_enter`/`io_uring_register`
-   (and reconsider `userfaultfd`, `perf_event_open`) to the deny-list; add a test.
-3. **C / D (DoS)** — add `cpu.max`/cpuset and a work-dir size/inode quota.
-4. **F / G (info leak)** — mask non-namespaced `/proc` entries.
-5. Update `docs/security.md`: the "capability-less / `CapBnd` empty" claim is only
-   true until the child calls `clone(CLONE_NEWUSER)`; the deny-list's `unshare`
-   rule should be described as *incomplete* (clone/clone3 uncovered).
+1. **A (clone userns)** — **DONE.** `clone` arg-filtered on `CLONE_NEWUSER`/
+   `CLONE_NEWNS` and `clone3` given `ENOSYS`; escape test 16 added. (Prior change.)
+2. **B (io_uring)** — **DONE.** `io_uring_setup`/`io_uring_enter`/
+   `io_uring_register` denied with `ENOSYS`; escape test 17 added. `userfaultfd` /
+   `perf_event_open` and the other adjacent newer syscalls remain a deny-list
+   residual (see Finding B "The fix") — a candidate for a future allow-list pass.
+3. **C (CPU DoS)** — **DONE.** Per-request cgroup v2 `cpu.max` via
+   `--cgroup_cpu_ms_per_sec`, sized per language in `configs/languages.yaml`; escape
+   test 18 added.
+4. **D (disk DoS)** — **DOCUMENTED KNOWN LIMITATION.** Single-file writes are already
+   bounded by `rlimit_fsize` (escape test 19); the many-files bulk-fill case has no
+   proportionate code fix given the host-bind-mount architecture, so it is documented
+   with a container-side operational mitigation (size-limit `/tmp`, monitor disk).
+5. **F / G (info leak)** — **F DOCUMENTED KNOWN LIMITATION.** Masking
+   `/proc/cpuinfo`/`meminfo` risks JVM/Node runtime breakage; `version`/`loadavg` are
+   maskable but low-value. Documented with per-file reasoning and gVisor as the clean
+   fix; escape test 20 records the current state. G unchanged (THEORETICAL / LOW).
+6. `docs/security.md` — **DONE** (in the Finding A change): the "capability-less"
+   claim now notes it holds only because `unshare`/`clone`/`clone3` are all filtered;
+   this round adds the seccomp io_uring rule, the cgroup CPU pillar, and the D/F
+   known limitations.
 
 ## Appendix — implicit nsjail default rlimits (undocumented defense-in-depth)
 

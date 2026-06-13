@@ -33,18 +33,39 @@ user-/mount-namespace creation primitives**: `unshare`, `clone` (both filtered o
 their `CLONE_NEWUSER`/`CLONE_NEWNS` flag arguments), and `clone3` (which hides its
 flags behind a pointer seccomp cannot inspect, so it is given `ENOSYS` — making
 glibc fall back to the filtered `clone` and a direct `clone3(CLONE_NEWUSER)` fail).
-These are the syscalls that could be used to escape or undermine the other
-isolation mechanisms (e.g. `mount` could remount a read-only bind mount as
-read-write; `setns` could join the host's namespaces; `ptrace` could attach to and
-control another process; creating a new **user namespace** would hand the caller a
-full capability set inside it — see the capability note below). Everything else is
-allowed, so normal program behavior (file I/O, memory allocation, process and
-thread creation for compilers and managed runtimes, etc.) is unaffected.
+It also denies **`io_uring`** (`io_uring_setup`/`io_uring_enter`/
+`io_uring_register`, likewise via `ENOSYS` so a probe-and-fallback runtime such as
+libuv reverts to its thread pool rather than crashing): io_uring is a large kernel
+attack surface and, because its submitted operations run on kernel worker threads,
+a channel a per-task seccomp filter cannot otherwise see. These are the syscalls
+that could be used to escape or undermine the other isolation mechanisms (e.g.
+`mount` could remount a read-only bind mount as read-write; `setns` could join the
+host's namespaces; `ptrace` could attach to and control another process; creating a
+new **user namespace** would hand the caller a full capability set inside it — see
+the capability note below). Everything else is allowed, so normal program behavior
+(file I/O, memory allocation, process and thread creation for compilers and managed
+runtimes, etc.) is unaffected.
 
-**cgroup v2 memory limits.** Each language has a memory limit (from
-`configs/languages.yaml`) enforced via `--cgroup_mem_max` with swap disabled,
-so a process that allocates too much resident memory is OOM-killed rather than
-being allowed to exhaust host memory or stall indefinitely.
+This filter is the **uniform backstop for every language, not just C.** Although C
+is the only runtime that can issue a raw syscall from its own source, *any* of the
+seven can reach raw syscalls by loading a native shared object from the writable
+work directory (py3 `import` of a `.cpython-*.so`, Node `process.dlopen`, Java
+`System.load`/JNI) — so the seccomp layer, not mount minimalism, is what contains
+dangerous syscalls across all seven, and it is applied identically to each.
+
+**cgroup v2 resource limits.** Each language has per-step limits (from
+`configs/languages.yaml`) enforced via cgroup v2: a **memory** limit
+(`--cgroup_mem_max` with swap disabled, so a process that allocates too much
+resident memory is OOM-killed rather than exhausting host memory or stalling), a
+**process-count** limit (`--cgroup_pids_max`, so a fork bomb hits `EAGAIN` rather
+than spawning unboundedly), and a **CPU-bandwidth** limit (`--cgroup_cpu_ms_per_sec`
+→ `cpu.max`, so a request cannot consume more than a few cores' worth of CPU). The
+CPU limit is the counterpart to the wall-clock limit: `--time_limit` bounds *elapsed*
+time, but a request running many busy threads could otherwise pin every host core
+for its whole window, and with the server's `NumCPU`-wide concurrency cap a handful
+of such requests could saturate the box. `cpu.max` throttles (it does not kill), so
+normal short-lived compiles/runs are unaffected while a CPU-spinner is bounded and
+still ended by the wall limit.
 
 **Why all three matter together:** a single mechanism alone has gaps. Filesystem
 isolation alone wouldn't stop a process from using `setns`/`mount` to undo that
@@ -209,3 +230,29 @@ short-lived sandboxes" usage pattern this service has.
   nsjail's default behaviour (it clones a fresh PID namespace unless told otherwise)
   rather than an explicit `--clone_newpid` flag, so it would silently regress if
   `--disable_clone_newpid` were ever added to the argument builder.
+- **The per-request work directory has no total-size disk quota** (audit Finding D).
+  It is a host-backed bind mount (it must be: build and run are separate nsjail
+  invocations that hand the compiled artifact over through it), so it cannot be a
+  size-limited tmpfs, and a real per-request disk quota (loop-mounted fs / project
+  quotas) is disproportionate. The *single-file* case is already bounded — nsjail's
+  default `rlimit_fsize` (1 MiB) caps any one file (escape suite test 19) — but a
+  program that creates *many* files can still fill the work dir's backing store
+  (a disk-fill DoS, not an isolation breach). Per-request `os.RemoveAll` cleanup and
+  the `NumCPU` concurrency cap keep the pressure transient and bounded in width.
+  **Recommended operational mitigation:** mount the container's `/tmp` (where work
+  dirs live) as a size-limited tmpfs (e.g. `--tmpfs /tmp:size=512m`) so a fill is
+  contained to the container, and monitor/alert on disk usage. See
+  `docs/security-audit-findings.md` Finding D.
+- **`/proc` leaks a few non-namespaced host facts** (audit Finding F): `/proc/cpuinfo`
+  (CPU model/cores), `/proc/meminfo` (RAM), `/proc/loadavg` (host load — a
+  low-bandwidth co-tenant side channel) and `/proc/version` (kernel version) reflect
+  the host, not the sandbox. This is information disclosure / fingerprinting, **not**
+  a breach — nothing here reads, writes, or affects anything outside the sandbox.
+  Masking these files is not done because it risks runtime breakage: the JVM and
+  V8/Node read `/proc/cpuinfo` (and the JVM may read `/proc/meminfo`) to size thread
+  pools and heaps, so a fake/empty file could mis-size or fail them; `/proc/version`
+  and `/proc/loadavg` are maskable but low-value. The clean, complete fix is a
+  sandbox that *synthesises* `/proc` (gVisor — see "Strengthening the boundary"),
+  which closes the whole class without per-file fakes. Verified/recorded by escape
+  suite test 20; see `docs/security-audit-findings.md` Finding F for the per-file
+  reasoning.

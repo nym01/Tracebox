@@ -31,8 +31,10 @@ the normal `go test ./...` run, exactly like the `integration`-tagged tests.
 ## Group 1 — Filesystem isolation (mount namespace + bind mounts)
 
 Target: each request runs in a fresh mount namespace with a minimal read-only
-root (interpreter + libs + stdlib) plus one writable per-request work dir. All
-five attempts use `py3`. All five **held**.
+root (interpreter + libs + stdlib) plus one writable per-request work dir. The
+original five attempts (1-5) all use `py3` and all **held**. Two later additions
+(tests 19 and 20, from the red-team audit) probe the writable work dir's disk
+behaviour and `/proc` host-info leakage.
 
 | # | Test | Attempt | Result | Outcome |
 |---|------|---------|--------|---------|
@@ -41,6 +43,8 @@ five attempts use `py3`. All five **held**.
 | 3 | `TestWriteOutsideWorkDir` | write `/`, `/tmp`, `/usr`, `/etc` | all denied (`OSError` read-only / `FileNotFoundError`); control write to the work dir (`/tmp/goboxd-*`) succeeds | **Held (expected)** |
 | 4 | `TestListRootDirectory` | `os.listdir('/')` | `['lib', 'lib64', 'proc', 'tmp', 'usr']` — minimal constructed root, no host top-level dirs | **Held (expected)** |
 | 5 | `TestProcPidNamespaceIsolation` | enumerate `/proc` pids; read other pids' `environ`/`maps` | `getpid()==1`; only pid visible is `1` (self); pids 2/100/1000 absent; own environ holds only injected `PATH` | **Held (expected)** |
+| 19 | `TestSingleFileWriteBounded` | append 256 KiB chunks to one file until 2 GiB (audit Finding D) | cut off near 1 MiB by nsjail's default `rlimit_fsize` (no `MiB=64`+, no `DONE`); service responsive after | **Held (single-file bound); bulk-fill = documented limitation** |
+| 20 | `TestProcHostInfoLeak` | read `/proc/{cpuinfo,meminfo,loadavg,version}` (audit Finding F) | host CPU model / RAM / load / kernel version are readable — logged, not failed; only fails if `/proc` is no longer mounted | **Documents a known limitation (info leak, no breach)** |
 
 ### Notes on individual tests
 
@@ -72,6 +76,34 @@ or documented in Phase 1; it is now verified. Worth recording in
 `docs/security.md` that PID-namespace isolation relies on nsjail's default and
 would silently regress if `--disable_clone_newpid` were ever added.
 
+**Test 19 — single-file disk write is bounded; bulk fill is a documented
+limitation.** The writable work dir is a host-backed bind mount (it must be: build
+and run are separate nsjail invocations that hand the compiled artifact over through
+it), so it cannot be swapped for a size-limited tmpfs, and a real per-request disk
+quota is disproportionate — so audit Finding D's disk-fill DoS is, in the general
+(many-files) case, a **documented known limitation** with a container-side
+operational mitigation (size-limit `/tmp`; monitor disk). What *is* already enforced
+and what this test verifies is the single-file bound: nsjail's default `rlimit_fsize`
+(1 MiB) caps any one file, so a program appending to one file is cut off near 1 MiB
+(via `EFBIG` or a `SIGXFSZ` terminate) rather than writing arbitrarily large. The
+test asserts the file never reaches an obviously-large size and the service survives;
+it deliberately does **not** exercise the many-small-files path (that would actually
+fill disk) — that residual is the documented limitation.
+
+**Test 20 — `/proc` leaks host facts (documented limitation, not a fix).** `/proc` is
+mounted read-only, and several non-namespaced files reflect the host: `/proc/cpuinfo`
+(CPU model/cores), `/proc/meminfo` (RAM), `/proc/loadavg` (host load — a co-tenant
+side channel) and `/proc/version` (kernel version). This is information disclosure /
+fingerprinting (audit Finding F), **not** an isolation breach. Masking these files is
+not done because it risks runtime breakage — the JVM and V8/Node read `/proc/cpuinfo`
+(and the JVM may read `/proc/meminfo`) to size thread pools and heaps; the clean fix
+is a sandbox that synthesises `/proc` (gVisor — see `docs/security.md` "Strengthening
+the boundary"). Like test 12 (the zero-page boundary), this test **documents** the
+current behaviour rather than asserting a fix: it logs which host facts are visible
+and does not fail on the leak. It fails only if `/proc` stops being mounted entirely
+(which would change the premise of tests 2 and 5), so a future change to `/proc`
+handling cannot pass silently.
+
 ---
 
 ## Group 2 — seccomp syscall filtering (the kafel deny-list)
@@ -86,9 +118,11 @@ the call, which nsjail surfaces as a non-zero exit, so the API reports the run a
 These tests use **C** — the only one of the seven runtimes that can issue a raw
 syscall directly (see the test-8 note). Each program prints a flushed `BEFORE`
 marker, issues the denied syscall, then prints `AFTER`; a blocked attempt shows
-`BEFORE` but never `AFTER`. All **held**. (Test 16 was added later, when the
-red-team audit's Finding A closed the `clone`/`clone3` user-namespace gap; it is
-grouped here because it targets the same kafel deny-list.)
+`BEFORE` but never `AFTER`. All **held**. (Tests 16 and 17 were added later, when the
+red-team audit's Findings A and B closed the `clone`/`clone3` user-namespace gap and
+the io_uring gap; they are grouped here because they target the same kafel deny-list.
+Both are denied via `ENOSYS` rather than KILL, so — unlike tests 6-9 — the program
+runs to completion rather than dying at the call.)
 
 | # | Test | Attempt | Result | Outcome |
 |---|------|---------|--------|---------|
@@ -98,6 +132,7 @@ grouped here because it targets the same kafel deny-list.)
 | 9 | `TestSeccompSetns` | `open(/proc/self/ns/mnt)` then `setns(fd,0)` | open succeeds (`fd=3`); `setns` SIGSYS-killed → `runtime_error`; `"BEFORE fd=3\n"`, no `AFTER` | **Held (expected)** |
 | 10 | `TestSeccompForkAllowed` | `fork()` + `waitpid()` (negative control) | child exits 7, parent prints `FORK_OK`, exit 0 → `accepted` | **Held (expected)** |
 | 16 | `TestSeccompCloneNewuserBlocked` | `clone3(CLONE_NEWUSER)` then `clone(CLONE_NEWUSER)` (audit Finding A) | `clone3` → `-1`/`ENOSYS` (`CLONE3_RET=-1 errno=38`, no namespace); `clone` SIGSYS-killed → `runtime_error`; `"BEFORE\nCLONE3_RET=-1 errno=38\n"`, no `CLONE_USERNS_OK`, no `AFTER` | **Held (expected) — Finding A closed** |
+| 17 | `TestSeccompIoUringBlocked` | `io_uring_setup(8, &params)` via raw syscall (audit Finding B) | `io_uring_setup` → `-1`/`ENOSYS` (`IO_URING_DENIED ret=-1 errno=38`, no ring); program runs *past* the call to `AFTER` (ENOSYS is a graceful denial, not a kill), so **not** `runtime_error`; no `IO_URING_OK` | **Held (expected) — Finding B closed** |
 
 ### Notes on individual tests
 
@@ -150,7 +185,23 @@ seccomp cannot read — is given `ENOSYS`, so glibc falls back to the filtered
 and asserts neither creates a namespace; test 10 (fork/clone negative control)
 still passes, confirming ordinary process/thread creation is untouched.
 
-### No new gaps (with one later exception, now fixed)
+**Test 17 — io_uring, denied by ENOSYS rather than killed.** Added when the red-team
+audit's Finding B flagged io_uring (`io_uring_setup`/`enter`/`register`) as fully
+available — a large kernel attack surface and, because its operations run on kernel
+worker threads, a channel a per-task seccomp filter cannot see. The pre-fix probe
+returned a real ring fd (`IO_URING_OK fd=3`). The fix adds the three syscalls to the
+policy's `ENOSYS` block (alongside `clone3`), **not** the KILL block: io_uring is
+feature-probed by modern runtimes (libuv ≥ 1.45 attempts `io_uring_setup` and falls
+back to its thread pool on failure), so a KILL would risk a fatal SIGSYS on a future
+toolchain bump, whereas ENOSYS looks exactly like a kernel without io_uring — the
+documented fallback trigger. Because `io_uring_setup` itself is denied, no ring is
+ever created, closing both halves of the finding. The test asserts the call returns
+`-1`/`ENOSYS` (no `IO_URING_OK`) and that the program runs *past* it to `AFTER` —
+the ENOSYS shape, distinct from the SIGSYS-kill shape of tests 6-9. The current image
+(Debian bookworm: Node 18 / libuv 1.44) calls io_uring nowhere, so no language's
+behaviour changes.
+
+### No new gaps (with later exceptions, now fixed)
 
 At the time Group 2 was first run, the seccomp group surfaced nothing beyond what
 Phase 1's policy and `docs/security.md` documented: every named syscall is killed,
@@ -176,13 +227,16 @@ soft spill-to-swap). Each language carries a `memory_kb` budget in
 process whose **resident** footprint exceeds it is OOM-killed (SIGKILL → nsjail
 exit 137 → API `memory_exceeded`). Tests 11-12 hold. **Test 13 originally surfaced
 a real gap — `max_processes` was unenforced — which has since been fixed; it now
-holds, with process count capped via a cgroup v2 `pids.max` limit.**
+holds, with process count capped via a cgroup v2 `pids.max` limit.** **Test 18 (added
+later) covers the fourth resource limit: per-request CPU bandwidth via a cgroup v2
+`cpu.max` limit (`--cgroup_cpu_ms_per_sec`), closing audit Finding C.**
 
 | # | Test | Attempt | Result | Outcome |
 |---|------|---------|--------|---------|
 | 11 | `TestMemoryBombResidentPy3` / `…Java` | allocate + touch every page until the budget is crossed (py3 100 MiB, java 512 MiB) | OOM-killed mid-allocation: py3 at ~90 MiB, java at ~450 MiB → `memory_exceeded` | **Held (expected)** |
 | 12 | `TestMemoryBombZeroPage` | `mmap.mmap(-1, 1 GiB, MAP_PRIVATE)` then read-only walk (10× py3's budget) | completes `accepted` in ~210 ms — untouched private pages map the shared zero page, never charged to `memory.max` | **Held (documents a boundary)** |
 | 13 | `TestForkBombProcessLimit` | bounded fork bomb, children sleep (linear, self-capped at 2000) | `fork()` fails with **`EAGAIN` at `created=63`** (1 parent + 63 children = 64 tasks = c's `pids.max`); program exits non-zero → `runtime_error` in ~12–72 ms; service responsive after | **Held (expected) — `max_processes` now enforced** |
+| 18 | `TestCpuExhaustionBound` | 16-thread C busy-spinner (audit Finding C); + finite py3 compute as positive control | spinner is throttled by `cpu.max` but bounded by the wall limit → `time_exceeded`, service responsive after; positive control returns `accepted` (cap does not throttle normal work into a false `time_exceeded`) | **Held (expected) — CPU limit now enforced** |
 
 ### Notes on individual tests
 
@@ -256,12 +310,30 @@ subprocesses (g++/gcc → cc1plus/cc1, as, ld; iverilog → ivlpp/ivl via `syste
 but their build budgets (100 for c/cpp/java, 50 for verilog) leave ample headroom —
 all seven languages' hello-world programs still build and run `accepted`.
 
-### The one-time gap, now closed
+**Test 18 — CPU-exhaustion bound, the fourth resource limit.** Added when the
+red-team audit's Finding C noted that the first three limits bound elapsed time,
+resident memory and task count — but **not CPU consumed**, so one request running its
+full `pids.max` of busy threads could pin every host core for its whole wall window,
+and with the `NumCPU`-wide concurrency cap a few such requests could saturate the box
+(a noisy-neighbour / availability DoS, not an isolation breach). The fix adds a
+per-request cgroup v2 `cpu.max` limit via nsjail's `--cgroup_cpu_ms_per_sec`, sized
+per language in `configs/languages.yaml` (`cpu_ms_per_sec`: 1000–4000, i.e. 1–4
+cores). `cpu.max` **throttles, it does not kill**, so a value set generously can only
+ever slow a program, never change its result: normal short-lived compiles/runs are
+untouched, and a CPU-spinner is throttled but still ended by the wall limit
+(`time_exceeded`). The cap's *primary* effect — bounding host cores consumed — is not
+observable through the HTTP API, so it is covered by unit tests
+(`TestCgroupCpuLimit*` in `internal/runner`); what this black-box test verifies is
+the two end-to-end properties that must hold: the spinner is cleanly bounded and the
+service survives, and a normal finite compute is **not** throttled into a false
+`time_exceeded`.
+
+### The one-time gaps, now closed
 
 Group 3 originally found one real gap — process-count limiting via `max_processes`
-was configured but unenforced (test 13) — which has since been fixed (see above): the
-fork bomb is now bounded at the configured count via a cgroup v2 `pids.max` limit, and
-the test asserts that bound. Tests 11-12 held throughout; test 12 additionally
+was configured but unenforced (test 13) — since fixed via a cgroup v2 `pids.max`
+limit, with the test asserting that bound. A later audit pass added the CPU-bandwidth
+limit (test 18, `cpu.max`). Tests 11-12 held throughout; test 12 additionally
 documents that `memory.max` is a resident-only limit and that `MAP_SHARED` anonymous
 pages (unlike `MAP_PRIVATE`) are charged even on read.
 
@@ -336,5 +408,8 @@ recording so neither silently regresses.
 ### Regression
 
 - `go test ./...` — pass (unit/feature suites unaffected by the new `escapetests`-tagged files).
-- `go test -tags escapetests -v ./escapetests/...` — all 15 pass.
+- `go test -tags escapetests -v ./escapetests/...` — tests 1-18 hold; tests 19-20
+  document the work-dir disk and `/proc` limitations (Findings D and F). (The
+  `escapetests` suite runs against a live Docker + nsjail container on Linux; see
+  "How to run". Tests 16-20 were added with the red-team audit fixes.)
 - `go vet ./...` and `go vet -tags escapetests ./escapetests/...` — clean.

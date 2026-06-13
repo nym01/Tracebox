@@ -1,11 +1,23 @@
 languages:
+  # cpu_ms_per_sec is the cgroup v2 CPU bandwidth budget: milliseconds of CPU time
+  # per wall-clock second the whole sandbox may use (1000 = one core, 2000 = two,
+  # 4000 = four). It bounds CPU *consumed* — wall_time_s only bounds elapsed time, so
+  # without it a request running its full max_processes of busy threads can pin every
+  # host core for its whole window, and NumCPU such concurrent requests saturate the
+  # box (audit Finding C). cpu.max THROTTLES, it does not kill: normal compiles/runs
+  # use little sustained CPU and finish well within wall_time_s, so they are never
+  # slowed; only a CPU-spinner is capped (and still ends at wall_time_s → time_exceeded).
+  # Because the limit can only ever slow a program, never change its result, the values
+  # are sized generously — ≥1 core, and 4 for the JVM (the most thread-parallel runtime:
+  # JIT + GC) — to leave zero risk of a false time_exceeded on legitimate multi-threaded
+  # startup, while still bounding each request to a few cores so concurrency cannot amplify.
   - id: py3
     name: Python 3
     source_filename: solution.py
     run:
       cmd: /usr/bin/python3
       args: ["{{source}}"]
-      limits: { wall_time_s: 9, memory_kb: 102400, max_processes: 100 }
+      limits: { wall_time_s: 9, memory_kb: 102400, max_processes: 100, cpu_ms_per_sec: 1000 }
 
   - id: cpp
     name: C++
@@ -14,11 +26,11 @@ languages:
     build:
       cmd: /usr/bin/g++
       args: ["{{flags}}", "-o", "{{artifact}}", "{{source}}"]
-      limits: { wall_time_s: 3, memory_kb: 1048576, max_processes: 100 }
+      limits: { wall_time_s: 3, memory_kb: 1048576, max_processes: 100, cpu_ms_per_sec: 2000 }
       flag_allowlist: ["-O0","-O1","-O2","-O3","-Wall","-Wextra","-std=*"]
     run:
       cmd: ./{{artifact}}
-      limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64 }
+      limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64, cpu_ms_per_sec: 2000 }
 
   - id: c
     name: C
@@ -27,11 +39,11 @@ languages:
     build:
       cmd: /usr/bin/gcc
       args: ["{{flags}}", "-o", "{{artifact}}", "{{source}}"]
-      limits: { wall_time_s: 3, memory_kb: 1048576, max_processes: 100 }
+      limits: { wall_time_s: 3, memory_kb: 1048576, max_processes: 100, cpu_ms_per_sec: 2000 }
       flag_allowlist: ["-O0","-O1","-O2","-O3","-Wall","-Wextra","-std=*"]
     run:
       cmd: ./{{artifact}}
-      limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64 }
+      limits: { wall_time_s: 3, memory_kb: 524288, max_processes: 64, cpu_ms_per_sec: 2000 }
 
   - id: bash
     name: Bash
@@ -39,7 +51,7 @@ languages:
     run:
       cmd: /usr/bin/bash
       args: ["{{source}}"]
-      limits: { wall_time_s: 5, memory_kb: 65536, max_processes: 10 }
+      limits: { wall_time_s: 5, memory_kb: 65536, max_processes: 10, cpu_ms_per_sec: 1000 }
 
   - id: js
     name: JavaScript
@@ -47,7 +59,7 @@ languages:
     run:
       cmd: /usr/bin/node
       args: ["{{source}}"]
-      limits: { wall_time_s: 5, memory_kb: 262144, max_processes: 50 }
+      limits: { wall_time_s: 5, memory_kb: 262144, max_processes: 50, cpu_ms_per_sec: 2000 }
 
   - id: java
     name: Java
@@ -56,12 +68,12 @@ languages:
     build:
       cmd: /usr/bin/javac
       args: ["{{flags}}", "{{source}}"]
-      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100 }
+      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100, cpu_ms_per_sec: 4000 }
       flag_allowlist: ["-g","-Xlint:all","-Xlint:none"]
     run:
       cmd: /usr/bin/java
       args: ["{{artifact}}"]
-      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100 }
+      limits: { wall_time_s: 6, memory_kb: 524288, max_processes: 100, cpu_ms_per_sec: 4000 }
 
   - id: verilog
     name: Verilog
@@ -71,9 +83,9 @@ languages:
     build:
       cmd: /usr/bin/iverilog
       args: ["{{flags}}", "-o", "{{artifact}}", "{{source}}"]
-      limits: { wall_time_s: 10, memory_kb: 262144, max_processes: 50 }
+      limits: { wall_time_s: 10, memory_kb: 262144, max_processes: 50, cpu_ms_per_sec: 2000 }
       flag_allowlist: ["-g2012","-Wall","-Wno-timescale"]
     run:
       cmd: /usr/bin/vvp
       args: ["{{artifact}}"]
-      limits: { wall_time_s: 5, memory_kb: 131072, max_processes: 50 }
+      limits: { wall_time_s: 5, memory_kb: 131072, max_processes: 50, cpu_ms_per_sec: 2000 }
