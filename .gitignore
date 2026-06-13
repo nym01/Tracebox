@@ -12,6 +12,9 @@
 # match the cmd/tracebox API-server directory).
 /tracebox
 
+# MCP server binary built at the repo root by tracebox.sh / tracebox.ps1.
+/tracebox-mcp
+
 # Test binary, built with `go test -c`
 *.test
 

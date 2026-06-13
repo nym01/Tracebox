@@ -4,38 +4,47 @@ goboxd is an HTTP sandbox runner that accepts source code, compiles or interpret
 
 ## Quick Start
 
-Get from a fresh clone to running a script in the sandbox in three steps.
+One command takes a fresh clone to a fully working setup: it starts the
+sandbox API, builds and installs the `tracebox` CLI onto your PATH, builds the
+MCP server, and (if Claude Code is installed) registers it.
 
-**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) (runs the
-sandbox API) and [Go](https://go.dev/dl/) (builds the CLI).
+**Prerequisites:**
+- [Docker](https://docs.docker.com/get-docker/) — runs the sandbox API
+  (Docker Desktop must be running)
+- [Go](https://go.dev/dl/) — builds the CLI and MCP server
+- _Optional:_ [Claude Code](https://docs.claude.com/en/docs/claude-code) — if
+  present, the script registers the Tracebox MCP server with it automatically
 
-**1. Start the sandbox API** (builds the image and runs it in the background):
+**Run the setup script** from the repo root:
 
 ```sh
-docker compose up -d --build
-```
-
-**2. Install the CLI** (one-time setup — builds `tracebox` and puts it on your PATH):
-
-```sh
-./install.sh        # Linux / macOS
+./tracebox.sh       # Linux / macOS
 ```
 
 ```powershell
-.\install.ps1       # Windows (PowerShell)
+.\tracebox.ps1      # Windows (PowerShell)
 ```
 
-Restart your terminal afterward if the script changed your PATH.
+The script is safe to re-run — it skips work that is already done (containers
+already up, CLI already installed, MCP already registered). The first run can
+take a few minutes because it builds the sandbox image (including nsjail).
 
-**3. Run any script in the sandbox**, from any folder:
+**Then run any script in the sandbox**, from any folder:
 
 ```sh
 tracebox run script.py
 ```
 
+Restart your terminal first if the script reported that it changed your PATH.
+
 The code executes inside Tracebox's locked-down sandbox (no network, tight
 CPU/memory limits, throwaway filesystem) — never on your own machine. See
 [`cmd/tracebox-cli`](cmd/tracebox-cli) for all CLI options.
+
+### Manual setup
+
+Prefer to do it by hand? Start the API with `docker compose up -d --build`,
+then run `./install.sh` (or `.\install.ps1`) to build and install just the CLI.
 
 ## Framework
 
