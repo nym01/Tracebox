@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -264,8 +265,23 @@ func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 	if err := cmd.Start(); err != nil {
 		return RunResult{}, err
 	}
+
+	// Notify the file-open tracer of this spawn so it can discover the sandboxed
+	// child and attribute its opens. Run concurrently (discovery polls /proc
+	// briefly) but joined before returning, so no goroutine outlives the run and
+	// any cgroup registration is on the books before the caller reads events.
+	var startWG sync.WaitGroup
+	if spec.OnStart != nil {
+		startWG.Add(1)
+		go func(pid int) {
+			defer startWG.Done()
+			spec.OnStart(pid)
+		}(cmd.Process.Pid)
+	}
+
 	waitErr := cmd.Wait()
 	durationMs := time.Since(start).Milliseconds()
+	startWG.Wait()
 
 	var exitCode int
 	if cmd.ProcessState != nil {

@@ -1,0 +1,7 @@
+# Generated / host-specific build artifacts — regenerate via build-and-run.sh.
+vmlinux.h          # 150k+ lines, dumped from the host kernel's BTF
+ebpf-poc           # compiled loader binary
+trace_bpfel.go     # bpf2go-generated Go bindings (little-endian)
+trace_bpfeb.go     # bpf2go-generated Go bindings (big-endian)
+trace_bpfel.o      # compiled BPF object (little-endian)
+trace_bpfeb.o      # compiled BPF object (big-endian)

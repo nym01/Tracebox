@@ -38,6 +38,14 @@ type RunSpec struct {
 	// that ultimately ends a spinner. The point is bounding the per-request CPU draw
 	// so concurrent requests cannot saturate every host core (CPU-exhaustion DoS).
 	CPUMsPerSec int
+	// OnStart, if non-nil, is invoked once just after the sandboxed process is
+	// spawned, with the PID of the nsjail wrapper process (cmd.Process.Pid). It
+	// lets an out-of-sandbox observer — the eBPF file-open tracer — discover the
+	// sandboxed child and start attributing its file opens while the run is in
+	// flight. The runner runs it concurrently with the run and waits for it to
+	// return before reporting the result, so it must not block for long.
+	// SubprocessRunner ignores it; only NsjailRunner calls it.
+	OnStart func(nsjailPID int)
 }
 
 // RunResult holds what came back from the subprocess.

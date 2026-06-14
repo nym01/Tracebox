@@ -12,6 +12,7 @@ import (
 	"github.com/nym01/goboxd/internal/api"
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
+	"github.com/nym01/goboxd/internal/tracer"
 )
 
 // Commit is injected at build time via -ldflags "-X main.Commit=$(git rev-parse --short HEAD)".
@@ -86,6 +87,20 @@ func main() {
 		log.Fatalf("startup: %v", err)
 	}
 	api.SetRunner(r)
+
+	// Start the eBPF file-open tracer (Phase 4). It attaches once for the
+	// process lifetime and captures the files each sandboxed run opens. It needs
+	// a privileged Linux container with BTF; if it cannot start (non-privileged
+	// dev, non-Linux, missing capabilities) the server runs normally with tracing
+	// disabled rather than failing — the sandbox itself does not depend on it.
+	if t, err := tracer.Start(); err != nil {
+		log.Printf("tracer: file-open tracing disabled: %v", err)
+	} else {
+		defer t.Stop()
+		api.SetTracer(t)
+		log.Println("tracer: file-open tracing enabled")
+	}
+
 	api.InitReadyz(nsjailPath)
 
 	mux := http.NewServeMux()

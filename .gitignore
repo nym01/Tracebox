@@ -34,6 +34,13 @@ go.work.sum
 # env file
 .env
 
+# Phase 4 eBPF tracer: bpf2go-generated artifacts, regenerated at image build
+# time by `go generate ./internal/tracer/` (see Dockerfile builder stage).
+internal/tracer/trace_bpfel.go
+internal/tracer/trace_bpfeb.go
+internal/tracer/trace_bpfel.o
+internal/tracer/trace_bpfeb.o
+
 # Editor/IDE
 # .idea/
 # .vscode/

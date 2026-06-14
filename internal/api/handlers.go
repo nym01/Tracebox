@@ -15,16 +15,28 @@ import (
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
 	"github.com/nym01/goboxd/internal/status"
+	"github.com/nym01/goboxd/internal/tracer"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
 
 var defaultRunner runner.Runner = runner.SubprocessRunner{}
 
+// fileTracer is the process-wide eBPF file-open tracer, or nil when tracing is
+// disabled (non-nsjail runner, non-Linux, or Start failed). Its methods are
+// nil-safe, so the run handler uses it unconditionally.
+var fileTracer *tracer.Tracer
+
 // SetRunner replaces the Runner used to execute build and test commands.
 // Called once at startup to select between SubprocessRunner and NsjailRunner.
 func SetRunner(r runner.Runner) {
 	defaultRunner = r
+}
+
+// SetTracer installs the eBPF file-open tracer used to capture per-run file
+// opens. Called once at startup; nil leaves tracing disabled.
+func SetTracer(t *tracer.Tracer) {
+	fileTracer = t
 }
 
 func RegisterRoutes(mux *http.ServeMux) {
@@ -95,6 +107,36 @@ func emitRunLog(l runLog) {
 	fmt.Fprintln(os.Stdout, string(line))
 }
 
+// fileOpenLog is the structured JSON log line emitted for one file the
+// sandboxed run opened, captured by the eBPF tracer. run_id correlates it with
+// the run's emitRunLog line. One line is emitted per opened file.
+type fileOpenLog struct {
+	RunID     string `json:"run_id"`
+	Event     string `json:"event"` // always "file_open"
+	Syscall   string `json:"syscall"`
+	Path      string `json:"path"`
+	Timestamp string `json:"timestamp"`
+}
+
+// emitTraceEvents writes one structured JSON log line per file the run opened,
+// alongside the run-completion log line. No-op when tracing is disabled (run is
+// nil) or nothing was captured.
+func emitTraceEvents(runID string, run *tracer.Run) {
+	for _, ev := range run.Events() {
+		line, err := json.Marshal(fileOpenLog{
+			RunID:     runID,
+			Event:     "file_open",
+			Syscall:   ev.Syscall,
+			Path:      ev.Path,
+			Timestamp: ev.Time.Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			continue
+		}
+		fmt.Fprintln(os.Stdout, string(line))
+	}
+}
+
 func run(w http.ResponseWriter, r *http.Request) {
 	incrementJobsTotal()
 
@@ -131,6 +173,11 @@ func run(w http.ResponseWriter, r *http.Request) {
 		runID = v.String()
 	}
 	runStart := time.Now()
+
+	// Begin collecting the file opens this run makes. Nil-safe when tracing is
+	// disabled. Closed at the end of the request to free the kernel-side filter.
+	traceRun := fileTracer.NewRun()
+	defer traceRun.Close()
 
 	tmpDir, err := os.MkdirTemp("", "goboxd-*")
 	if err != nil {
@@ -181,6 +228,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			MemoryKB:     buildLimits.MemoryKB,
 			MaxProcesses: buildLimits.MaxProcesses,
 			CPUMsPerSec:  buildLimits.CPUMsPerSec,
+			OnStart:      traceRun.Attach,
 		})
 		if buildErr != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
@@ -204,6 +252,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 				notExecuted[i] = TestResult{Status: status.NotExecuted}
 			}
 			topStatus := status.TopLevel(bstatus, nil)
+			emitTraceEvents(runID, traceRun)
 			emitRunLog(runLog{
 				RunID:      runID,
 				Language:   req.Language,
@@ -248,6 +297,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			MemoryKB:     runLimits.MemoryKB,
 			MaxProcesses: runLimits.MaxProcesses,
 			CPUMsPerSec:  runLimits.CPUMsPerSec,
+			OnStart:      traceRun.Attach,
 		})
 		if runErr != nil {
 			testResults[i] = TestResult{Status: status.InternalError}
@@ -288,6 +338,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 	topStatus := status.TopLevel(status.BuildOK, testStatuses)
 
+	emitTraceEvents(runID, traceRun)
 	emitRunLog(runLog{
 		RunID:      runID,
 		Language:   req.Language,

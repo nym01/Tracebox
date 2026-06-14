@@ -1,9 +1,19 @@
 FROM golang:1.25 AS builder
 WORKDIR /app
+# eBPF toolchain for the Phase 4 file-open tracer: clang/llvm compile
+# internal/tracer/trace.bpf.c to a BPF ELF object, libbpf-dev provides
+# <bpf/bpf_helpers.h>, linux-libc-dev provides the linux uapi headers. bpftool is
+# not needed: the BPF program uses only stable tracepoint fields + helpers, so it
+# requires no generated vmlinux.h. CGO stays disabled — bpf2go embeds the .o.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev && \
+    rm -rf /var/lib/apt/lists/*
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o goboxd ./cmd/tracebox
+# Generate the bpf2go bindings + embedded object from trace.bpf.c, then build.
+RUN go generate ./internal/tracer/ && \
+    CGO_ENABLED=0 GOOS=linux go build -o goboxd ./cmd/tracebox
 
 # Build nsjail from source (pinned to tag 3.4 via the external/nsjail submodule).
 # Do NOT bundle a prebuilt binary and do NOT install nsjail from apt — it must
