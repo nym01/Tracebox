@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 // inside the build container, not on the host. See the Dockerfile builder stage.
 // The trailing -I points clang's bpf target at Debian's multiarch include dir so
 // <asm/types.h> (pulled in by <linux/bpf.h>) resolves; the build image is amd64.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type event -type exec_event trace trace.bpf.c -- -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type event -type exec_event -type connect_event trace trace.bpf.c -- -I/usr/include/x86_64-linux-gnu
 
 // tracefsPath is where link.Tracepoint() resolves tracepoints; the goboxd
 // container does not mount it by default, so Start mounts it (privileged).
@@ -34,15 +35,19 @@ var syscallName = map[uint8]string{0: "openat", 1: "openat2"}
 // execSyscallName maps the eBPF exec syscall tag to a name.
 var execSyscallName = map[uint8]string{0: "execve", 1: "execveat"}
 
+// connectSyscallName maps the eBPF connect syscall tag to a name.
+var connectSyscallName = map[uint8]string{0: "connect"}
+
 // Tracer is the process-wide, persistent syscall monitor. It owns the eBPF
 // programs/maps, the ring-buffer reader goroutines (one for file opens, one for
-// process spawns), and the registry mapping a live run's cgroup id to the Run
-// collecting its events.
+// process spawns, one for network connects), and the registry mapping a live
+// run's cgroup id to the Run collecting its events.
 type Tracer struct {
 	objs       traceObjects
 	links      []link.Link
 	reader     *ringbuf.Reader // file-open events
 	execReader *ringbuf.Reader // process-spawn events
+	netReader  *ringbuf.Reader // network-connect events
 
 	mu   sync.RWMutex
 	runs map[uint64]*Run // cgroup id -> run collecting that cgroup's events
@@ -96,6 +101,13 @@ func Start() (*Tracer, error) {
 	}
 	t.links = append(t.links, lExecveat)
 
+	lConnect, err := link.Tracepoint("syscalls", "sys_enter_connect", t.objs.TpConnect, nil)
+	if err != nil {
+		t.close()
+		return nil, fmt.Errorf("tracer: attach sys_enter_connect: %w", err)
+	}
+	t.links = append(t.links, lConnect)
+
 	rd, err := ringbuf.NewReader(t.objs.Events)
 	if err != nil {
 		t.close()
@@ -111,8 +123,18 @@ func Start() (*Tracer, error) {
 	}
 	t.execReader = execRd
 
+	netRd, err := ringbuf.NewReader(t.objs.NetEvents)
+	if err != nil {
+		t.reader.Close()
+		t.execReader.Close()
+		t.close()
+		return nil, fmt.Errorf("tracer: open net ringbuf reader: %w", err)
+	}
+	t.netReader = netRd
+
 	go t.readLoop()
 	go t.readExecLoop()
+	go t.readNetLoop()
 	return t, nil
 }
 
@@ -188,6 +210,38 @@ func (t *Tracer) readExecLoop() {
 	}
 }
 
+// readNetLoop drains the network-connect ring buffer and routes each event to the
+// run that owns its cgroup id, until the reader is closed by Stop. It mirrors
+// readLoop but decodes connect_event and formats the destination address/port.
+func (t *Tracer) readNetLoop() {
+	var ev traceConnectEvent
+	for {
+		rec, err := t.netReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &ev); err != nil {
+			continue
+		}
+		t.mu.RLock()
+		run := t.runs[ev.Cgid]
+		t.mu.RUnlock()
+		if run == nil {
+			continue // event for a cgroup no longer (or not yet) registered
+		}
+		run.add(Event{
+			Kind:     "connect",
+			Syscall:  connectSyscallName[ev.Syscall],
+			DestIP:   destIP(ev.Family, ev.Addr),
+			DestPort: int(ntohs(ev.Port)),
+			Time:     time.Now(),
+		})
+	}
+}
+
 // register starts routing events for cgid to run.
 func (t *Tracer) register(cgid uint64, run *Run) {
 	t.mu.Lock()
@@ -216,6 +270,9 @@ func (t *Tracer) Stop() error {
 	}
 	if t.execReader != nil {
 		t.execReader.Close() // unblocks readExecLoop with ErrClosed
+	}
+	if t.netReader != nil {
+		t.netReader.Close() // unblocks readNetLoop with ErrClosed
 	}
 	return t.close()
 }
@@ -326,4 +383,24 @@ func cstr(b []int8) string {
 		u = append(u, byte(c))
 	}
 	return string(u)
+}
+
+// ntohs converts a 16-bit value from network byte order (as the port sits in the
+// sockaddr and is copied verbatim by the BPF program) to host order. The decode
+// path is little-endian-only (binary.LittleEndian above), matching the amd64
+// deployment target, so a fixed byte swap is correct here.
+func ntohs(v uint16) uint16 { return v<<8 | v>>8 }
+
+// destIP renders the raw destination address bytes captured from the sockaddr as
+// a string: addr[0:4] for AF_INET, addr[0:16] for AF_INET6. Unknown families
+// never reach here (the BPF side emits only AF_INET/AF_INET6 records).
+func destIP(family uint16, addr [16]uint8) string {
+	switch family {
+	case 2: // AF_INET
+		return net.IP(addr[0:4]).String()
+	case 10: // AF_INET6
+		return net.IP(addr[0:16]).String()
+	default:
+		return ""
+	}
 }

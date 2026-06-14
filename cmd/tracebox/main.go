@@ -88,9 +88,10 @@ func main() {
 	}
 	api.SetRunner(r)
 
-	// Start the eBPF syscall tracer (Phase 4): file opens (openat/openat2) and
-	// process spawns (execve/execveat). It attaches once for the process lifetime
-	// and captures what each sandboxed run opens and spawns. It needs a privileged
+	// Start the eBPF syscall tracer (Phase 4): file opens (openat/openat2),
+	// process spawns (execve/execveat) and network connects (connect). It attaches
+	// once for the process lifetime and captures what each sandboxed run opens,
+	// spawns and tries to connect to. It needs a privileged
 	// Linux container with BTF; if it cannot start (non-privileged dev, non-Linux,
 	// missing capabilities) the server runs normally with tracing disabled rather
 	// than failing — the sandbox itself does not depend on it. Set GOBOXD_TRACER=off
@@ -102,7 +103,7 @@ func main() {
 	} else {
 		defer t.Stop()
 		api.SetTracer(t)
-		log.Println("tracer: syscall tracing enabled (file-open + exec)")
+		log.Println("tracer: syscall tracing enabled (file-open + exec + connect)")
 	}
 
 	api.InitReadyz(nsjailPath)

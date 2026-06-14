@@ -131,9 +131,24 @@ type execLog struct {
 	Timestamp string   `json:"timestamp"`
 }
 
+// connectLog is the structured JSON log line emitted for one network connection
+// the sandboxed run attempted (connect), captured by the eBPF tracer. run_id
+// correlates it with the run's emitRunLog line. The attempt is recorded even
+// though the sandbox's empty network namespace makes it fail (ENETUNREACH) — it
+// captures intent (the destination the code wanted to reach). One line is emitted
+// per connect attempt.
+type connectLog struct {
+	RunID     string `json:"run_id"`
+	Event     string `json:"event"` // always "connect"
+	Syscall   string `json:"syscall"`
+	DestIP    string `json:"dest_ip"`
+	DestPort  int    `json:"dest_port"`
+	Timestamp string `json:"timestamp"`
+}
+
 // emitTraceEvents writes one structured JSON log line per syscall the run made
-// (a file_open or an exec), alongside the run-completion log line. No-op when
-// tracing is disabled (run is nil) or nothing was captured.
+// (a file_open, an exec, or a connect), alongside the run-completion log line.
+// No-op when tracing is disabled (run is nil) or nothing was captured.
 func emitTraceEvents(runID string, run *tracer.Run) {
 	for _, ev := range run.Events() {
 		var line []byte
@@ -146,6 +161,15 @@ func emitTraceEvents(runID string, run *tracer.Run) {
 				Syscall:   ev.Syscall,
 				Path:      ev.Path,
 				Argv:      ev.Argv,
+				Timestamp: ev.Time.Format(time.RFC3339Nano),
+			})
+		case "connect":
+			line, err = json.Marshal(connectLog{
+				RunID:     runID,
+				Event:     "connect",
+				Syscall:   ev.Syscall,
+				DestIP:    ev.DestIP,
+				DestPort:  ev.DestPort,
 				Timestamp: ev.Time.Format(time.RFC3339Nano),
 			})
 		default: // "file_open"

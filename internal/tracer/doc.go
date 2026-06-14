@@ -1,8 +1,8 @@
 // Package tracer is goboxd's Phase 4 eBPF syscall monitor. It attaches, once for
-// the lifetime of the process, to the openat(2)/openat2(2) and
-// execve(2)/execveat(2) syscall-entry tracepoints and records every file a
-// sandboxed run opens and every process it spawns, from outside the sandbox,
-// attributed to the run by cgroup id.
+// the lifetime of the process, to the openat(2)/openat2(2), execve(2)/execveat(2)
+// and connect(2) syscall-entry tracepoints and records every file a sandboxed
+// run opens, every process it spawns, and every network connection it attempts,
+// from outside the sandbox, attributed to the run by cgroup id.
 //
 // # Design (v1, minimal)
 //
@@ -45,16 +45,29 @@
 // trace.bpf.c). The caps keep the in-kernel copy loop within the BPF verifier's
 // complexity budget and the event record a fixed size; the captured prefix is
 // enough to recognise a spawn (the program and its leading flags/targets).
+//
+// # connect capture (Phase 4c)
+//
+// connect events carry the destination IP and port extracted from the sockaddr
+// at syscall entry. Both IPv4 (AF_INET) and IPv6 (AF_INET6) are captured; other
+// address families (AF_UNIX, AF_NETLINK, …) produce no event since they have no
+// IP/port to report. The capture is for audit visibility only: the sandbox's
+// network namespace is empty, so the connect() itself fails with ENETUNREACH —
+// but the destination the code *wanted* to reach is recorded regardless, which
+// the failure alone would not reveal. Tracing is observability, not enforcement;
+// the network blocking is unchanged (see escape test 15 in docs/escape-tests.md).
 package tracer
 
 import "time"
 
-// Event is one syscall observed inside a traced run: a file open or a process
-// spawn, distinguished by Kind.
+// Event is one syscall observed inside a traced run: a file open, a process
+// spawn, or a network connection attempt, distinguished by Kind.
 type Event struct {
-	Kind    string    // "file_open" or "exec"
-	Syscall string    // "openat"/"openat2" for file_open; "execve"/"execveat" for exec
-	Path    string    // the filename argument passed to the syscall
-	Argv    []string  // captured argv prefix (exec only; nil for file_open)
-	Time    time.Time // when user space observed the event
+	Kind     string    // "file_open", "exec" or "connect"
+	Syscall  string    // "openat"/"openat2" (file_open); "execve"/"execveat" (exec); "connect" (connect)
+	Path     string    // the filename argument passed to the syscall (file_open/exec only)
+	Argv     []string  // captured argv prefix (exec only; nil otherwise)
+	DestIP   string    // destination IP address (connect only; "" otherwise)
+	DestPort int       // destination port (connect only; 0 otherwise)
+	Time     time.Time // when user space observed the event
 }

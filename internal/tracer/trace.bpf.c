@@ -1,21 +1,32 @@
 //go:build ignore
 
-// trace.bpf.c — Phase 4 file-open + process-spawn tracer (production, wired into
-// goboxd).
+// trace.bpf.c — Phase 4 file-open + process-spawn + network-connect tracer
+// (production, wired into goboxd).
 //
-// Hooks the openat(2)/openat2(2) and execve(2)/execveat(2) syscall-entry
-// tracepoints and emits records over two ring buffers — file opens on `events`,
-// process spawns on `exec_events` — for every syscall made by a task whose
-// cgroup id is registered in the active_cgroups map. User space (internal/tracer)
-// registers a run's cgroup id when the run starts and removes it when the run
-// ends, so only the sandboxed children of in-flight /run requests produce events
-// — the rest of the host is filtered out in-kernel.
+// Hooks the openat(2)/openat2(2), execve(2)/execveat(2) and connect(2)
+// syscall-entry tracepoints and emits records over three ring buffers — file
+// opens on `events`, process spawns on `exec_events`, connection attempts on
+// `net_events` — for every syscall made by a task whose cgroup id is registered
+// in the active_cgroups map. User space (internal/tracer) registers a run's
+// cgroup id when the run starts and removes it when the run ends, so only the
+// sandboxed children of in-flight /run requests produce events — the rest of the
+// host is filtered out in-kernel.
 //
-// The two event families use separate ring buffers (rather than one tagged
-// buffer) so the high-frequency open stream and the much rarer exec stream stay
-// independent: an interpreter-startup burst of opens never pushes the larger
-// exec records (which carry argv) out of a shared buffer, and the file-open path
-// stays byte-for-byte unchanged from the Phase-4a tracer.
+// The three event families use separate ring buffers (rather than one tagged
+// buffer) so the high-frequency open stream, the much rarer exec stream, and the
+// rare-but-tiny connect stream stay independent: an interpreter-startup burst of
+// opens never pushes the larger exec records (which carry argv) out of a shared
+// buffer; the file-open path stays byte-for-byte unchanged from the Phase-4a
+// tracer; and the userspace reader for each buffer decodes a single fixed struct
+// type with no per-record discriminator. (Phase 4c chose a third buffer over
+// reusing exec_events for this type-safety/independence, even though connect
+// events are small and rare — the cost of one more 64 KiB ring is negligible.)
+//
+// connect(2) is traced for audit visibility, not enforcement: the sandbox's
+// network namespace is empty (only lo, no routes), so connect() fails with
+// ENETUNREACH — but the destination the sandboxed code *tried* to reach is
+// captured at syscall entry, before the kernel rejects it. This records intent
+// ("this run tried to reach 8.8.8.8:53") that the failure alone would hide.
 //
 // Why cgroup-id filtering (not the POC's pidns filtering): every nsjail run is
 // placed in its own cgroup (NSJAIL.<pid>) before the child execs, and the
@@ -49,6 +60,12 @@ char LICENSE[] SEC("license") = "GPL";
 // the record and risk verifier rejection on this kernel — see internal/tracer.
 #define ARGV_MAX 8
 #define ARG_LEN  64
+
+// Address families we extract a destination from. Other families (AF_UNIX, etc.)
+// produce no event — there is no IP/port to report. Values are the stable Linux
+// uapi constants.
+#define AF_INET  2
+#define AF_INET6 10
 
 // Stable layout of the syscall-entry tracepoint context. args[1] is the second
 // syscall argument: for both openat(dfd, filename, ...) and openat2(dfd,
@@ -85,12 +102,28 @@ struct exec_event {
 	char  args[ARGV_MAX][ARG_LEN];
 };
 
-// struct event / struct exec_event are only ever touched through a ringbuf
-// pointer, so clang may omit them from the object's BTF — which makes bpf2go's
-// `-type` fail with "collect C types: not found". Dummy globals of each type
-// force BTF emission.
+// One connect(2) attempt. family is the socket address family (AF_INET or
+// AF_INET6); port is the destination port in network byte order (as it sits in
+// the sockaddr — user space converts); addr holds the raw destination address
+// bytes — IPv4 in addr[0..3], IPv6 in addr[0..15]. Captured at syscall entry, so
+// it records the intended destination even though the connect() ultimately fails
+// (the sandbox netns has no route). Only AF_INET/AF_INET6 produce a record.
+struct connect_event {
+	__u64 cgid;
+	__u64 ts_ns;
+	__u16 family;
+	__u16 port;
+	__u8  syscall; // 0 = connect
+	__u8  addr[16];
+};
+
+// struct event / struct exec_event / struct connect_event are only ever touched
+// through a ringbuf pointer, so clang may omit them from the object's BTF — which
+// makes bpf2go's `-type` fail with "collect C types: not found". Dummy globals of
+// each type force BTF emission.
 const struct event *unused_event __attribute__((unused));
 const struct exec_event *unused_exec_event __attribute__((unused));
+const struct connect_event *unused_connect_event __attribute__((unused));
 
 // Ring buffer for file-open events -> user space (1 MiB; python emits a burst of
 // opens at interpreter startup, so size generously).
@@ -106,6 +139,14 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 18);
 } exec_events SEC(".maps");
+
+// Ring buffer for network-connect events -> user space. connect() attempts are
+// rare (most sandboxed runs make none) and each record is tiny, so a small
+// buffer is ample.
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 16);
+} net_events SEC(".maps");
 
 // Cgroup ids user space wants traced. Key = cgroup id, value = unused marker.
 // User space Put()s a run's cgroup id on start and Delete()s it on completion.
@@ -202,4 +243,57 @@ int tp_execveat(struct trace_event_raw_sys_enter *ctx)
 {
 	return handle_exec((const char *)ctx->args[1],
 			   (const char *const *)ctx->args[2], 1);
+}
+
+static __always_inline int handle_connect(const void *uaddr, __u8 which)
+{
+	__u64 cgid = bpf_get_current_cgroup_id();
+	if (!bpf_map_lookup_elem(&active_cgroups, &cgid))
+		return 0; // not a task belonging to a traced run
+
+	// sa_family is the first field of every sockaddr (sockaddr_in.sin_family /
+	// sockaddr_in6.sin6_family). Read it from user memory first so we can skip
+	// families that carry no IP/port (AF_UNIX, AF_NETLINK, …) without reserving a
+	// record for them.
+	__u16 family = 0;
+	if (bpf_probe_read_user(&family, sizeof(family), uaddr) != 0)
+		return 0;
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	struct connect_event *e = bpf_ringbuf_reserve(&net_events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	e->cgid = cgid;
+	e->ts_ns = bpf_ktime_get_ns();
+	e->syscall = which;
+	e->family = family;
+	e->port = 0;
+	__builtin_memset(e->addr, 0, sizeof(e->addr));
+
+	// Extract the destination from the sockaddr in user memory. Both layouts put
+	// the port at byte offset 2 (network byte order); the address follows at
+	// offset 4 (sockaddr_in.sin_addr, 4 bytes) or offset 8 (sockaddr_in6.sin6_addr,
+	// after the 4-byte sin6_flowinfo, 16 bytes). Constant sizes keep the verifier
+	// happy.
+	if (family == AF_INET) {
+		bpf_probe_read_user(&e->port, sizeof(e->port), (const __u8 *)uaddr + 2);
+		bpf_probe_read_user(e->addr, 4, (const __u8 *)uaddr + 4);
+	} else { // AF_INET6
+		bpf_probe_read_user(&e->port, sizeof(e->port), (const __u8 *)uaddr + 2);
+		bpf_probe_read_user(e->addr, 16, (const __u8 *)uaddr + 8);
+	}
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+// connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) — the
+// destination sockaddr is args[1]. One tracepoint covers both TCP and UDP
+// connect() calls.
+SEC("tracepoint/syscalls/sys_enter_connect")
+int tp_connect(struct trace_event_raw_sys_enter *ctx)
+{
+	return handle_connect((const void *)ctx->args[1], 0);
 }
