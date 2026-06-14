@@ -150,9 +150,27 @@ type connectLog struct {
 
 // emitTraceEvents writes one structured JSON log line per syscall the run made
 // (a file_open, an exec, or a connect), alongside the run-completion log line.
-// No-op when tracing is disabled (run is nil) or nothing was captured.
-func emitTraceEvents(runID string, run *tracer.Run) {
-	for _, ev := range run.Events() {
+// The events come from whichever source applies to the run's runner — the eBPF
+// tracer for nsjail, runsc --strace for gVisor — already merged into one slice by
+// the caller, so this is source-agnostic. No-op on an empty slice.
+// combineTraceEvents merges the run's two possible audit sources into one slice:
+// the eBPF tracer's events (nsjail runs) and the gVisor runner's strace events
+// (gVisor runs). For any given run only one source has events — the eBPF tracer
+// captures nothing under gVisor, and the nsjail/subprocess runners return no
+// RunResult events — so this is a plain concatenation, kept in a helper so both
+// the build-failed and normal return paths share it. eBPF events come first to
+// preserve their existing order; that is moot when (as is always the case) the
+// other source is empty.
+func combineTraceEvents(traceRun *tracer.Run, gvisorEvents []tracer.Event) []tracer.Event {
+	ebpf := traceRun.Events()
+	if len(gvisorEvents) == 0 {
+		return ebpf
+	}
+	return append(ebpf, gvisorEvents...)
+}
+
+func emitTraceEvents(runID string, events []tracer.Event) {
+	for _, ev := range events {
 		var line []byte
 		var err error
 		switch ev.Kind {
@@ -229,8 +247,13 @@ func run(w http.ResponseWriter, r *http.Request) {
 
 	// Begin collecting the file opens this run makes. Nil-safe when tracing is
 	// disabled. Closed at the end of the request to free the kernel-side filter.
+	// This is the nsjail/eBPF source; the gVisor runner instead returns its strace
+	// events in each RunResult, accumulated in gvisorEvents below. Exactly one of
+	// the two is populated for a given run (eBPF sees nothing under gVisor, and
+	// nsjail returns no RunResult events), so combineTraceEvents simply merges them.
 	traceRun := fileTracer.NewRun()
 	defer traceRun.Close()
+	var gvisorEvents []tracer.Event
 
 	tmpDir, err := os.MkdirTemp("", "goboxd-*")
 	if err != nil {
@@ -287,6 +310,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "compiler process failed to start")
 			return
 		}
+		gvisorEvents = append(gvisorEvents, bres.TraceEvents...)
 
 		bstatus := status.BuildOK
 		if bres.TimedOut || bres.ExitCode != 0 {
@@ -307,7 +331,8 @@ func run(w http.ResponseWriter, r *http.Request) {
 			topStatus := status.TopLevel(bstatus, nil)
 			durationMs := time.Since(runStart).Milliseconds()
 			timestamp := time.Now().Format(time.RFC3339)
-			emitTraceEvents(runID, traceRun)
+			events := combineTraceEvents(traceRun, gvisorEvents)
+			emitTraceEvents(runID, events)
 			emitRunLog(runLog{
 				RunID:      runID,
 				Language:   req.Language,
@@ -316,7 +341,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 				DurationMs: durationMs,
 				Timestamp:  timestamp,
 			})
-			persistRun(r.Context(), runID, req.Language, topStatus, bres.ExitCode, durationMs, timestamp, req.Source, buildResult, notExecuted, traceRun)
+			persistRun(r.Context(), runID, req.Language, topStatus, bres.ExitCode, durationMs, timestamp, req.Source, buildResult, notExecuted, events)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RunResponse{
 				RunID:  runID,
@@ -359,6 +384,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			testResults[i] = TestResult{Status: status.InternalError}
 			continue
 		}
+		gvisorEvents = append(gvisorEvents, result.TraceEvents...)
 
 		if result.ExitCode != 0 && runExitCode == 0 {
 			runExitCode = result.ExitCode
@@ -396,7 +422,8 @@ func run(w http.ResponseWriter, r *http.Request) {
 
 	durationMs := time.Since(runStart).Milliseconds()
 	timestamp := time.Now().Format(time.RFC3339)
-	emitTraceEvents(runID, traceRun)
+	events := combineTraceEvents(traceRun, gvisorEvents)
+	emitTraceEvents(runID, events)
 	emitRunLog(runLog{
 		RunID:      runID,
 		Language:   req.Language,
@@ -405,7 +432,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 		DurationMs: durationMs,
 		Timestamp:  timestamp,
 	})
-	persistRun(r.Context(), runID, req.Language, topStatus, runExitCode, durationMs, timestamp, req.Source, buildResult, testResults, traceRun)
+	persistRun(r.Context(), runID, req.Language, topStatus, runExitCode, durationMs, timestamp, req.Source, buildResult, testResults, events)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(RunResponse{RunID: runID, Status: topStatus, Build: buildResult, Tests: testResults})

@@ -1,6 +1,10 @@
 package runner
 
-import "context"
+import (
+	"context"
+
+	"github.com/nym01/goboxd/internal/tracer"
+)
 
 // RunSpec describes a single subprocess invocation.
 type RunSpec struct {
@@ -61,6 +65,16 @@ type RunResult struct {
 	// plain non-zero exit. Only NsjailRunner sets it; SubprocessRunner leaves it
 	// false. The handler maps it to the memory_exceeded status.
 	MemoryExceeded bool
+	// TraceEvents are the syscall audit events captured from WITHIN the runner for
+	// this single invocation, in the same shape the eBPF tracer produces
+	// (file_open/exec/connect). It is the gVisor path's equivalent of the eBPF
+	// tracer: under gVisor the guest's syscalls are serviced by the sentry and
+	// never reach the host tracepoints the eBPF tracer attaches to, so GvisorRunner
+	// instead parses runsc's own --strace output and returns the events here. The
+	// handler merges these into the same emit/persist path the eBPF events take, so
+	// /runs/{id} is runner-agnostic. SubprocessRunner and NsjailRunner leave it nil
+	// (NsjailRunner's events flow through the eBPF tracer via OnStart, not here).
+	TraceEvents []tracer.Event
 }
 
 // Runner executes a command and returns its result.

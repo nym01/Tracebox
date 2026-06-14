@@ -93,6 +93,17 @@ type GvisorRunner struct {
 	// proven baseline) is required for construction to succeed at all. An empty/nil
 	// map means the zero-value runner used only by the compile-time assertions.
 	Rootfs map[string]string
+
+	// Strace enables capturing a per-run syscall audit trail via runsc's own
+	// --strace, parsed into RunResult.TraceEvents (see gvisor_strace.go). It is the
+	// gVisor analogue of the eBPF tracer, which sees nothing for a gVisor run
+	// because the guest's syscalls are serviced by the sentry, not the host kernel
+	// (POC §5). NewGvisorRunner enables it by default; GOBOXD_GVISOR_STRACE=off
+	// turns it off (an A/B switch for measuring strace overhead, mirroring
+	// GOBOXD_TRACER=off for the eBPF tracer). The zero-value runner used by the
+	// compile-time assertions leaves it false, so spec/dispatch unit tests never
+	// touch strace.
+	Strace bool
 }
 
 // Rootfs names. Each names a tree under the rootfs base dir (gvisorRootfsBaseDir,
@@ -173,6 +184,24 @@ const (
 	// finishes well inside its guest budget is never falsely flagged time_exceeded;
 	// the cost is that a genuine runaway is killed up to grace seconds late.
 	gvisorWallGraceSec = 10
+
+	// gvisorStraceSyscalls scopes runsc --strace to just the syscalls the eBPF
+	// tracer also captures (passed via --strace-syscalls), so the strace log is not
+	// flooded with every guest syscall — the noise/overhead the task flags. These
+	// four are long-standing, core syscalls gVisor's strace table definitely knows,
+	// so the scoping cannot reject the flag. openat2 is deliberately omitted: it is
+	// newer and may be absent from the strace table in some runsc releases (which
+	// would make --strace-syscalls reject the whole run), and the common interpreter
+	// /compiler file-open path uses openat anyway — a documented, minor gap versus
+	// the eBPF tracer, which also watches openat2.
+	gvisorStraceSyscalls = "openat,execve,execveat,connect"
+
+	// gvisorDebugLogTmpl is the --debug-log destination. runsc substitutes
+	// %COMMAND% per sandbox component, so the guest's strace lands in the file whose
+	// name contains "boot" (e.g. runsc-boot.log); collectStraceEvents globs for it.
+	// The file lives inside the per-request bundle dir, so it is removed with the
+	// bundle when Run returns.
+	gvisorDebugLogTmpl = "runsc-%COMMAND%.log"
 )
 
 // defaultGvisorRootfsBaseDir is the directory under which the image build stages
@@ -232,6 +261,10 @@ func NewGvisorRunner(ctx context.Context, runscPath string) (GvisorRunner, error
 	return GvisorRunner{
 		RunscPath: runscPath,
 		Rootfs:    rootfs,
+		// Per-run strace audit is on by default (the point of Phase 7 Stage 3);
+		// GOBOXD_GVISOR_STRACE=off disables it for overhead A/B measurement, the
+		// gVisor analogue of GOBOXD_TRACER=off.
+		Strace: os.Getenv("GOBOXD_GVISOR_STRACE") != "off",
 	}, nil
 }
 
@@ -353,10 +386,29 @@ func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 	args := []string{
 		"--platform=" + gvisorPlatform,
 		"--network=none",
+	}
+	// Per-run syscall audit: runsc logs every guest syscall (scoped to
+	// gvisorStraceSyscalls) into its debug log, which is this stage's substitute for
+	// the eBPF tracer (the guest's syscalls never reach the host tracepoints). The
+	// strace text goes to the component debug log via --debug-log (the "boot"
+	// component carries the guest strace), parsed after the run by
+	// collectStraceEvents. --strace needs --debug to raise the sentry log to the
+	// level strace lines are emitted at; the added general debug volume is the main
+	// strace overhead, measured/flagged per the task (GOBOXD_GVISOR_STRACE=off
+	// turns the whole thing off for A/B).
+	if r.Strace {
+		args = append(args,
+			"--debug",
+			"--strace",
+			"--strace-syscalls="+gvisorStraceSyscalls,
+			"--debug-log="+filepath.Join(bundleDir, gvisorDebugLogTmpl),
+		)
+	}
+	args = append(args,
 		"run",
 		"--bundle", bundleDir,
 		containerID,
-	}
+	)
 
 	cmd := exec.CommandContext(runCtx, runscPath, args...)
 	cmd.Stdin = strings.NewReader(spec.Stdin)
@@ -370,10 +422,10 @@ func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 	// tracer attaches to HOST syscall tracepoints filtered by cgroup, but under
 	// gVisor the guest's syscalls are serviced by the sentry and never hit those
 	// host tracepoints (POC §5), so attaching would capture nothing useful for the
-	// guest. Skipping attachment entirely is the simplest correct behaviour for this
-	// stage: gVisor runs simply produce no trace events (the handler's traceRun
-	// stays empty, which emitTraceEvents/persistRun handle as a no-op). A gVisor-native
-	// trace source (runsc trace points) is future work.
+	// guest. The gVisor-native trace source is runsc's own --strace (enabled above
+	// when r.Strace is set), collected from the debug log after the run and returned
+	// in RunResult.TraceEvents — so the handler's eBPF traceRun stays empty for a
+	// gVisor run and the audit trail comes from the strace events instead.
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -419,6 +471,15 @@ func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 		// force) applies unchanged. spec.MemoryKB (the guest budget) is the >0 flag,
 		// independent of the headroom we add to the actual cgroup limit.
 		MemoryExceeded: oomKilled(exitCode, timedOut, spec.MemoryKB),
+	}
+
+	// Collect the gVisor-native syscall audit from runsc's strace/debug log, parsed
+	// into the same Event shape the eBPF tracer produces. Done unconditionally
+	// (including on timeout/OOM) so a killed run still reports what it did before it
+	// died — the log lines are already written. No-op when Strace is off (the log
+	// was never requested, so the glob finds nothing).
+	if r.Strace {
+		res.TraceEvents = collectStraceEvents(bundleDir)
 	}
 
 	if timedOut {

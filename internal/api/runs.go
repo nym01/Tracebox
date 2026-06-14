@@ -38,7 +38,7 @@ func SetStore(s *store.Store) {
 // compile_output is the build phase's combined output (empty for interpreted
 // languages). source is the exact code submitted, so the row is a self-contained
 // "what code produced what result" audit record.
-func persistRun(ctx context.Context, runID, language, status string, exitCode int, durationMs int64, timestamp, source string, build *BuildResult, tests []TestResult, traceRun *tracer.Run) {
+func persistRun(ctx context.Context, runID, language, status string, exitCode int, durationMs int64, timestamp, source string, build *BuildResult, tests []TestResult, events []tracer.Event) {
 	if runStore == nil {
 		return
 	}
@@ -72,16 +72,16 @@ func persistRun(ctx context.Context, runID, language, status string, exitCode in
 		CompileOutput: compileOutput,
 	}
 
-	events := traceEventRecords(traceRun)
-	if err := runStore.SaveRun(ctx, rec, events); err != nil {
+	if err := runStore.SaveRun(ctx, rec, traceEventRecords(events)); err != nil {
 		log.Printf("store: failed to persist run %s: %v", runID, err)
 	}
 }
 
-// traceEventRecords converts the tracer's captured events into store records. It
+// traceEventRecords converts the captured trace events into store records. It
 // mirrors emitTraceEvents but builds rows for persistence instead of log lines.
-func traceEventRecords(run *tracer.Run) []store.TraceEventRecord {
-	evs := run.Events()
+// The events are source-agnostic (eBPF or gVisor strace), already merged by the
+// caller.
+func traceEventRecords(evs []tracer.Event) []store.TraceEventRecord {
 	if len(evs) == 0 {
 		return nil
 	}
