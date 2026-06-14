@@ -1,0 +1,12 @@
+# Generated / downloaded artifacts — regenerate via build-and-run.sh.
+# (Comments must be on their own line: gitignore does not honour inline '#'.)
+
+# downloaded gVisor runtime binary (~50 MB) and its checksum
+runsc
+runsc.*
+
+# OCI bundle (config.json + a multi-hundred-MB rootfs)
+bundle/
+
+# runsc --debug / --strace logs
+*.log
