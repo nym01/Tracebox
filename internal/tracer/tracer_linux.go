@@ -22,25 +22,30 @@ import (
 // inside the build container, not on the host. See the Dockerfile builder stage.
 // The trailing -I points clang's bpf target at Debian's multiarch include dir so
 // <asm/types.h> (pulled in by <linux/bpf.h>) resolves; the build image is amd64.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type event trace trace.bpf.c -- -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type event -type exec_event trace trace.bpf.c -- -I/usr/include/x86_64-linux-gnu
 
 // tracefsPath is where link.Tracepoint() resolves tracepoints; the goboxd
 // container does not mount it by default, so Start mounts it (privileged).
 const tracefsPath = "/sys/kernel/tracing"
 
-// syscallName maps the eBPF syscall tag to a name.
+// syscallName maps the eBPF file-open syscall tag to a name.
 var syscallName = map[uint8]string{0: "openat", 1: "openat2"}
 
-// Tracer is the process-wide, persistent file-open monitor. It owns the eBPF
-// programs/maps, the ring-buffer reader goroutine, and the registry mapping a
-// live run's cgroup id to the Run collecting its events.
+// execSyscallName maps the eBPF exec syscall tag to a name.
+var execSyscallName = map[uint8]string{0: "execve", 1: "execveat"}
+
+// Tracer is the process-wide, persistent syscall monitor. It owns the eBPF
+// programs/maps, the ring-buffer reader goroutines (one for file opens, one for
+// process spawns), and the registry mapping a live run's cgroup id to the Run
+// collecting its events.
 type Tracer struct {
-	objs   traceObjects
-	links  []link.Link
-	reader *ringbuf.Reader
+	objs       traceObjects
+	links      []link.Link
+	reader     *ringbuf.Reader // file-open events
+	execReader *ringbuf.Reader // process-spawn events
 
 	mu   sync.RWMutex
-	runs map[uint64]*Run // cgroup id -> run collecting that cgroup's opens
+	runs map[uint64]*Run // cgroup id -> run collecting that cgroup's events
 }
 
 // Start mounts tracefs (if needed), loads the eBPF programs, attaches them to
@@ -77,6 +82,20 @@ func Start() (*Tracer, error) {
 	}
 	t.links = append(t.links, lOpenat2)
 
+	lExecve, err := link.Tracepoint("syscalls", "sys_enter_execve", t.objs.TpExecve, nil)
+	if err != nil {
+		t.close()
+		return nil, fmt.Errorf("tracer: attach sys_enter_execve: %w", err)
+	}
+	t.links = append(t.links, lExecve)
+
+	lExecveat, err := link.Tracepoint("syscalls", "sys_enter_execveat", t.objs.TpExecveat, nil)
+	if err != nil {
+		t.close()
+		return nil, fmt.Errorf("tracer: attach sys_enter_execveat: %w", err)
+	}
+	t.links = append(t.links, lExecveat)
+
 	rd, err := ringbuf.NewReader(t.objs.Events)
 	if err != nil {
 		t.close()
@@ -84,7 +103,16 @@ func Start() (*Tracer, error) {
 	}
 	t.reader = rd
 
+	execRd, err := ringbuf.NewReader(t.objs.ExecEvents)
+	if err != nil {
+		t.reader.Close()
+		t.close()
+		return nil, fmt.Errorf("tracer: open exec ringbuf reader: %w", err)
+	}
+	t.execReader = execRd
+
 	go t.readLoop()
+	go t.readExecLoop()
 	return t, nil
 }
 
@@ -110,8 +138,51 @@ func (t *Tracer) readLoop() {
 			continue // event for a cgroup no longer (or not yet) registered
 		}
 		run.add(Event{
+			Kind:    "file_open",
 			Syscall: syscallName[ev.Syscall],
 			Path:    cstr(ev.Filename[:]),
+			Time:    time.Now(),
+		})
+	}
+}
+
+// readExecLoop drains the process-spawn ring buffer and routes each exec event to
+// the run that owns its cgroup id, until the reader is closed by Stop. It mirrors
+// readLoop but decodes the larger exec_event (which carries argv).
+func (t *Tracer) readExecLoop() {
+	var ev traceExecEvent
+	for {
+		rec, err := t.execReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &ev); err != nil {
+			continue
+		}
+		t.mu.RLock()
+		run := t.runs[ev.Cgid]
+		t.mu.RUnlock()
+		if run == nil {
+			continue // event for a cgroup no longer (or not yet) registered
+		}
+		// Decode the captured argv prefix: argc entries, each a NUL-terminated
+		// C string truncated to ARG_LEN by the kernel side.
+		argc := min(int(ev.Argc), len(ev.Args))
+		var argv []string
+		if argc > 0 {
+			argv = make([]string, 0, argc)
+			for i := range argc {
+				argv = append(argv, cstr(ev.Args[i][:]))
+			}
+		}
+		run.add(Event{
+			Kind:    "exec",
+			Syscall: execSyscallName[ev.Syscall],
+			Path:    cstr(ev.Filename[:]),
+			Argv:    argv,
 			Time:    time.Now(),
 		})
 	}
@@ -142,6 +213,9 @@ func (t *Tracer) Stop() error {
 	}
 	if t.reader != nil {
 		t.reader.Close() // unblocks readLoop with ErrClosed
+	}
+	if t.execReader != nil {
+		t.execReader.Close() // unblocks readExecLoop with ErrClosed
 	}
 	return t.close()
 }

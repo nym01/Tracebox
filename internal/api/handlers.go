@@ -118,18 +118,45 @@ type fileOpenLog struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// emitTraceEvents writes one structured JSON log line per file the run opened,
-// alongside the run-completion log line. No-op when tracing is disabled (run is
-// nil) or nothing was captured.
+// execLog is the structured JSON log line emitted for one process the sandboxed
+// run spawned (execve/execveat), captured by the eBPF tracer. run_id correlates
+// it with the run's emitRunLog line. argv holds the captured argument prefix
+// (omitted when nothing was captured). One line is emitted per spawned process.
+type execLog struct {
+	RunID     string   `json:"run_id"`
+	Event     string   `json:"event"` // always "exec"
+	Syscall   string   `json:"syscall"`
+	Path      string   `json:"path"`
+	Argv      []string `json:"argv,omitempty"`
+	Timestamp string   `json:"timestamp"`
+}
+
+// emitTraceEvents writes one structured JSON log line per syscall the run made
+// (a file_open or an exec), alongside the run-completion log line. No-op when
+// tracing is disabled (run is nil) or nothing was captured.
 func emitTraceEvents(runID string, run *tracer.Run) {
 	for _, ev := range run.Events() {
-		line, err := json.Marshal(fileOpenLog{
-			RunID:     runID,
-			Event:     "file_open",
-			Syscall:   ev.Syscall,
-			Path:      ev.Path,
-			Timestamp: ev.Time.Format(time.RFC3339Nano),
-		})
+		var line []byte
+		var err error
+		switch ev.Kind {
+		case "exec":
+			line, err = json.Marshal(execLog{
+				RunID:     runID,
+				Event:     "exec",
+				Syscall:   ev.Syscall,
+				Path:      ev.Path,
+				Argv:      ev.Argv,
+				Timestamp: ev.Time.Format(time.RFC3339Nano),
+			})
+		default: // "file_open"
+			line, err = json.Marshal(fileOpenLog{
+				RunID:     runID,
+				Event:     "file_open",
+				Syscall:   ev.Syscall,
+				Path:      ev.Path,
+				Timestamp: ev.Time.Format(time.RFC3339Nano),
+			})
+		}
 		if err != nil {
 			continue
 		}

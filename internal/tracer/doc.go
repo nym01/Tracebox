@@ -1,7 +1,8 @@
-// Package tracer is goboxd's Phase 4 eBPF file-open monitor. It attaches, once
-// for the lifetime of the process, to the openat(2)/openat2(2) syscall-entry
-// tracepoints and records every file a sandboxed run opens, from outside the
-// sandbox, attributed to the run by cgroup id.
+// Package tracer is goboxd's Phase 4 eBPF syscall monitor. It attaches, once for
+// the lifetime of the process, to the openat(2)/openat2(2) and
+// execve(2)/execveat(2) syscall-entry tracepoints and records every file a
+// sandboxed run opens and every process it spawns, from outside the sandbox,
+// attributed to the run by cgroup id.
 //
 // # Design (v1, minimal)
 //
@@ -29,17 +30,31 @@
 // # v1 limitation
 //
 // Because the cgroup id is discovered just after spawn (not before), the few
-// file opens the child makes between exec and discovery completing — typically
-// the dynamic-linker/libc/interpreter-startup opens — can be missed. Every open
-// from discovery onward is captured. Race-free capture of the earliest opens is
-// a v2 concern that needs the nsjail cgroup-creation restructuring above.
+// events the child produces between exec and discovery completing — typically
+// the dynamic-linker/libc/interpreter-startup opens, and the very first exec
+// (the interpreter/compiler itself, spawned by nsjail before it is registered) —
+// can be missed. Everything from discovery onward is captured: the nested execs
+// a run makes (e.g. a bash script calling /bin/ls, or gcc invoking cc1/as/ld)
+// land well after registration. Race-free capture of the earliest events is a v2
+// concern that needs the nsjail cgroup-creation restructuring above.
+//
+// # exec argv capture
+//
+// Exec events carry the executable path plus a bounded prefix of argv (up to the
+// first 8 arguments, each truncated to 63 bytes — see ARGV_MAX/ARG_LEN in
+// trace.bpf.c). The caps keep the in-kernel copy loop within the BPF verifier's
+// complexity budget and the event record a fixed size; the captured prefix is
+// enough to recognise a spawn (the program and its leading flags/targets).
 package tracer
 
 import "time"
 
-// Event is one file-open observed inside a traced run.
+// Event is one syscall observed inside a traced run: a file open or a process
+// spawn, distinguished by Kind.
 type Event struct {
-	Syscall string    // "openat" or "openat2"
+	Kind    string    // "file_open" or "exec"
+	Syscall string    // "openat"/"openat2" for file_open; "execve"/"execveat" for exec
 	Path    string    // the filename argument passed to the syscall
+	Argv    []string  // captured argv prefix (exec only; nil for file_open)
 	Time    time.Time // when user space observed the event
 }
