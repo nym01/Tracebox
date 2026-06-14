@@ -11,46 +11,87 @@ import (
 // NsjailRunner / SubprocessRunner in nsjail_test.go).
 var _ Runner = GvisorRunner{}
 
-// testGvisorRunner returns a zero-value-ish GvisorRunner with a fixed rootfs path
-// for spec-construction tests. NewGvisorRunner is not used because it probes the
-// real runsc binary and on-disk rootfs, which a unit test must not require.
+// testGvisorRootfs is the fixed per-language rootfs map used by spec-construction
+// tests, one entry per rootfs name. NewGvisorRunner is not used because it probes
+// the real runsc binary and on-disk rootfs trees, which a unit test must not require.
+var testGvisorRootfs = map[string]string{
+	gvisorRootfsPy3:     "/opt/gvisor/rootfs/py3",
+	gvisorRootfsBash:    "/opt/gvisor/rootfs/bash",
+	gvisorRootfsJs:      "/opt/gvisor/rootfs/js",
+	gvisorRootfsCcpp:    "/opt/gvisor/rootfs/ccpp",
+	gvisorRootfsJava:    "/opt/gvisor/rootfs/java",
+	gvisorRootfsVerilog: "/opt/gvisor/rootfs/verilog",
+}
+
+// testGvisorRunner returns a GvisorRunner wired to testGvisorRootfs for
+// spec-construction tests.
 func testGvisorRunner() GvisorRunner {
-	return GvisorRunner{Py3RootfsPath: "/opt/gvisor/rootfs/py3"}
+	return GvisorRunner{Rootfs: testGvisorRootfs}
 }
 
-func TestGvisorLanguageGate(t *testing.T) {
-	// Only the python3 interpreter is supported this stage; every other language's
-	// command must be rejected so the runner never silently runs an unsupported
-	// language under an unprepared rootfs.
-	supported := []string{pythonInterpreter}
-	for _, cmd := range supported {
-		if !gvisorLanguageSupported(cmd) {
-			t.Errorf("gvisorLanguageSupported(%q) = false, want true", cmd)
+// TestGvisorRootfsName pins the command→rootfs dispatch for all seven languages,
+// including the two facets of the one-rootfs-per-language decision: c and cpp (both
+// the compiler drivers AND the shared "./solution" run step) route to the single
+// ccpp rootfs, and each interpreter/JDK/verilog step routes to its own tree. An
+// unrecognised command must not map.
+func TestGvisorRootfsName(t *testing.T) {
+	cases := map[string]string{
+		pythonInterpreter: gvisorRootfsPy3,
+		bashInterpreter:   gvisorRootfsBash,
+		nodeInterpreter:   gvisorRootfsJs,
+		cppCompiler:       gvisorRootfsCcpp,
+		cCompiler:         gvisorRootfsCcpp,
+		"./solution":      gvisorRootfsCcpp, // compiled-artifact run step (c or cpp)
+		javacCompiler:     gvisorRootfsJava,
+		javaRuntime:       gvisorRootfsJava,
+		iverilogCompiler:  gvisorRootfsVerilog,
+		vvpRuntime:        gvisorRootfsVerilog,
+	}
+	for cmd, want := range cases {
+		got, ok := gvisorRootfsName(cmd)
+		if !ok {
+			t.Errorf("gvisorRootfsName(%q) ok = false, want true (→ %q)", cmd, want)
+			continue
+		}
+		if got != want {
+			t.Errorf("gvisorRootfsName(%q) = %q, want %q", cmd, got, want)
 		}
 	}
-	unsupported := []string{
-		bashInterpreter, nodeInterpreter, cppCompiler, cCompiler,
-		javacCompiler, javaRuntime, iverilogCompiler, vvpRuntime,
-		"./solution", "/usr/bin/perl",
-	}
-	for _, cmd := range unsupported {
-		if gvisorLanguageSupported(cmd) {
-			t.Errorf("gvisorLanguageSupported(%q) = true, want false", cmd)
+	for _, cmd := range []string{"/usr/bin/perl", "/usr/bin/ruby", ""} {
+		if name, ok := gvisorRootfsName(cmd); ok {
+			t.Errorf("gvisorRootfsName(%q) = (%q, true), want (\"\", false)", cmd, name)
 		}
 	}
 }
 
-func TestGvisorRunRejectsUnsupportedLanguage(t *testing.T) {
-	// Run must return a clear error (not crash, not fall back) for a non-py3
-	// command, BEFORE attempting to build a bundle or invoke runsc. A non-existent
-	// runsc path proves runsc is never reached: the language gate fires first.
-	r := GvisorRunner{RunscPath: "/nonexistent/runsc", Py3RootfsPath: "/opt/gvisor/rootfs/py3"}
-	_, err := r.Run(t.Context(), RunSpec{Cmd: cppCompiler, Args: []string{"-o", "x", "x.cpp"}})
+func TestGvisorRunRejectsUnmappedCommand(t *testing.T) {
+	// Run must return a clear error (not crash, not fall back) for a command with no
+	// rootfs mapping, BEFORE attempting to build a bundle or invoke runsc. A
+	// non-existent runsc path proves runsc is never reached: the gate fires first.
+	r := GvisorRunner{RunscPath: "/nonexistent/runsc", Rootfs: testGvisorRootfs}
+	_, err := r.Run(t.Context(), RunSpec{Cmd: "/usr/bin/perl", Args: []string{"x.pl"}})
 	if err == nil {
-		t.Fatal("Run(cpp) returned nil error, want an unsupported-language error")
+		t.Fatal("Run(perl) returned nil error, want an unsupported-command error")
 	}
-	if !strings.Contains(err.Error(), "not yet supported") {
-		t.Errorf("Run(cpp) error = %q, want it to mention the language is not yet supported", err)
+	if !strings.Contains(err.Error(), "unsupported command") {
+		t.Errorf("Run(perl) error = %q, want it to mention an unsupported command", err)
+	}
+}
+
+func TestGvisorRunRejectsUnavailableRootfs(t *testing.T) {
+	// A known command whose rootfs was not staged (absent from the map) must get a
+	// clean "rootfs unavailable" error rather than running against a missing tree —
+	// the graceful-degradation contract. Here only py3 is present, so a java request
+	// is rejected, again before runsc is touched.
+	r := GvisorRunner{RunscPath: "/nonexistent/runsc", Rootfs: map[string]string{
+		gvisorRootfsPy3: "/opt/gvisor/rootfs/py3",
+	}}
+	_, err := r.Run(t.Context(), RunSpec{Cmd: javaRuntime, Args: []string{"Main"}})
+	if err == nil {
+		t.Fatal("Run(java) with no java rootfs returned nil error, want a rootfs-unavailable error")
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Errorf("Run(java) error = %q, want it to mention the rootfs is unavailable", err)
 	}
 }
 
@@ -64,7 +105,8 @@ func TestGvisorBuildOCISpecPy3(t *testing.T) {
 		MemoryKB:    102400, // py3 default
 		CPUMsPerSec: 1000,
 	}
-	oci := r.buildOCISpec(spec, "goboxd-gvisor-123")
+	py3Rootfs := r.Rootfs[gvisorRootfsPy3]
+	oci := r.buildOCISpec(spec, "goboxd-gvisor-123", py3Rootfs)
 
 	// Process args = Cmd + Args, cwd = the work-dir mount point.
 	wantArgs := []string{pythonInterpreter, "solution.py"}
@@ -80,9 +122,9 @@ func TestGvisorBuildOCISpecPy3(t *testing.T) {
 		t.Errorf("cwd = %q, want %q", oci.Process.Cwd, gvisorWorkDir)
 	}
 
-	// Root points at the shared rootfs, read-only.
-	if oci.Root.Path != r.Py3RootfsPath {
-		t.Errorf("root.path = %q, want %q", oci.Root.Path, r.Py3RootfsPath)
+	// Root points at the selected rootfs, read-only.
+	if oci.Root.Path != py3Rootfs {
+		t.Errorf("root.path = %q, want %q", oci.Root.Path, py3Rootfs)
 	}
 	if !oci.Root.Readonly {
 		t.Error("root.readonly = false, want true (shared read-only rootfs)")

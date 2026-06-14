@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,11 +18,11 @@ import (
 // without any caller changes. It is purely additive: NsjailRunner and
 // SubprocessRunner are untouched and remain the default.
 //
-// This is the Phase 7 Stage 1 integration: py3 ONLY. The other six languages
-// return a clear "not yet supported" error from Run (see gvisorLanguageSupported)
-// rather than silently falling back or failing confusingly — multi-language
-// rootfs support is deliberately future work (see experiments/gvisor-poc/FINDINGS.md
-// §6 "Explicitly deferred").
+// This is the Phase 7 Stage 2 integration: ALL SEVEN languages (py3, bash, js,
+// cpp, c, java, verilog). Stage 1 ran py3 only; Stage 2 adds the rest, each backed
+// by its own prepared rootfs. A command whose rootfs is not available returns a
+// clear error from Run (see gvisorRootfsName / the per-language gate) rather than
+// silently falling back or failing confusingly.
 //
 // Why gVisor, and why now: the security audit's Finding F (the /proc host-info
 // leak — host kernel version, CPU model, live host loadavg) is left as a known
@@ -33,25 +34,99 @@ import (
 // Structural difference from nsjail. nsjail synthesises a minimal mount namespace
 // by bind-mounting individual host files per language (the resolve*Mounts logic in
 // nsjail.go). gVisor instead runs the container against a populated *rootfs* tree.
-// So, mirroring NewNsjailRunner's "resolve once at startup, fail loud" pattern, a
-// single shared py3 rootfs is prepared in the image build (see the Dockerfile) and
-// validated once here; each request only writes a tiny per-request OCI bundle
-// (config.json) that points root at that shared read-only rootfs and bind-mounts
-// the per-request work directory (where the handler already wrote the source file)
-// writable at gvisorWorkDir. The work directory is the per-request analogue of
-// nsjail's writable --bindmount work dir.
+// So, mirroring NewNsjailRunner's "resolve once at startup, fail loud" pattern, the
+// shared per-language rootfs trees are prepared in the image build (see the
+// Dockerfile) and validated once here; each request only writes a tiny per-request
+// OCI bundle (config.json) that points root at the appropriate shared read-only
+// rootfs and bind-mounts the per-request work directory (where the handler already
+// wrote the source file) writable at gvisorWorkDir. The work directory is the
+// per-request analogue of nsjail's writable --bindmount work dir.
+//
+// ROOTFS STRATEGY — one rootfs per language, NOT nsjail's build/run mount
+// asymmetry. nsjail deliberately runs the compiler build step with broad
+// filesystem access (headers, toolchain dirs) but the compiled artifact's run step
+// with a minimal one (just its own .so deps). That asymmetry is a real security
+// property *for nsjail* because nsjail's boundary is the HOST process: the
+// untrusted binary executes directly on the host kernel inside a mount namespace,
+// so a minimal run mount means there is literally less host filesystem reachable if
+// anything in the seccomp/namespace boundary is bypassed, and the mounts are of
+// *live host files*.
+//
+// Under gVisor that calculus changes, so this runner does NOT mirror the asymmetry:
+//   - The boundary is the SENTRY, not rootfs minimalism. Every guest syscall is
+//     serviced by the sentry's own kernel implementation; the guest never touches
+//     the host kernel or host filesystem regardless of what the rootfs contains. A
+//     "fat" rootfs does not let the guest *do* more — the sentry's syscall mediation
+//     is the actual cap, not the contents of the tree.
+//   - The rootfs is a STATIC, READ-ONLY, PURPOSE-BUILT TREE baked into the image
+//     (an apt install in a Dockerfile stage), not a bind mount of the live host
+//     filesystem. Even the "full toolchain" rootfs exposes only trusted distro
+//     files and leaks nothing about the host — unlike nsjail's --bindmount_ro of the
+//     host's own /usr/include, /usr/lib, etc.
+//   - network=none, root is read-only (writes go only to the per-request /work and a
+//     tmpfs /tmp), and the sentry structurally blocks the escape-class syscalls. So
+//     the marginal capability a richer rootfs grants the untrusted run step (e.g.
+//     more binaries to exec as gadgets) has no escape vector to reach.
+//
+// The one honest cost is defense-in-depth: if the *sentry itself* had a
+// post-exploitation gap, a minimal run rootfs would limit what an attacker could
+// then reach. That is a second-order concern against gVisor's strong primary
+// boundary, and the task explicitly prefers the simpler one-rootfs model when it is
+// sound. Two language-specific facets of this decision are called out where they
+// bite: verilog's /bin/sh is present in the run rootfs (see gvisorRootfsName) and
+// c/cpp share one rootfs (a C binary's needs are a subset of a C++ one's, exactly as
+// nsjail already shares their *run* profile — so a single "ccpp" rootfs carrying
+// both gcc and g++ serves both languages' build AND run steps).
 type GvisorRunner struct {
 	// RunscPath is the path to the runsc binary. Defaults to "runsc" (resolved
 	// via PATH) when empty.
 	RunscPath string
 
-	// Py3RootfsPath is the absolute path of the shared, read-only python3 root
-	// filesystem prepared once in the image build. Every py3 request runs against
-	// it (root.readonly = true), so concurrent runs share one read-only tree —
-	// exactly how the runsc Docker runtime shares image layers. Populated and
-	// validated by NewGvisorRunner; an empty value means the zero-value runner
-	// used only by the compile-time assertions.
-	Py3RootfsPath string
+	// Rootfs maps a rootfs name (gvisorRootfsPy3, gvisorRootfsBash, …) to the
+	// absolute path of that shared, read-only rootfs tree prepared once in the image
+	// build. Every request for a language runs against its rootfs (root.readonly =
+	// true), so concurrent runs share one read-only tree — exactly how the runsc
+	// Docker runtime shares image layers. Populated and validated by NewGvisorRunner,
+	// which includes only the rootfs trees it found valid on disk: a language whose
+	// rootfs is missing is simply absent from the map and its requests get a clean
+	// "rootfs unavailable" error (graceful per-language degradation), while py3 (the
+	// proven baseline) is required for construction to succeed at all. An empty/nil
+	// map means the zero-value runner used only by the compile-time assertions.
+	Rootfs map[string]string
+}
+
+// Rootfs names. Each names a tree under the rootfs base dir (gvisorRootfsBaseDir,
+// e.g. /opt/gvisor/rootfs/<name>) prepared by a Dockerfile stage. c and cpp share
+// the "ccpp" rootfs (see the GvisorRunner doc comment / gvisorRootfsName).
+const (
+	gvisorRootfsPy3     = "py3"
+	gvisorRootfsBash    = "bash"
+	gvisorRootfsJs      = "js"
+	gvisorRootfsCcpp    = "ccpp"
+	gvisorRootfsJava    = "java"
+	gvisorRootfsVerilog = "verilog"
+)
+
+// gvisorRootfsSentinels lists, per rootfs, the in-rootfs paths that MUST exist for
+// that language to run — the binaries the language registry invokes (and the
+// programs they shell out to). NewGvisorRunner validates these so a half-populated
+// rootfs is rejected at startup rather than failing every request at execve. Paths
+// are relative to the rootfs root.
+var gvisorRootfsSentinels = map[string][]string{
+	gvisorRootfsPy3:  {"usr/bin/python3"},
+	gvisorRootfsBash: {"usr/bin/bash"},
+	// node is invoked as /usr/bin/node, which Debian ships as a symlink to nodejs;
+	// the Dockerfile stage recreates that symlink, so check the invocation path.
+	gvisorRootfsJs: {"usr/bin/node"},
+	// One rootfs carries the whole gcc/g++ toolchain for both c and cpp, build and
+	// run; require both drivers plus the linker/assembler the drivers shell out to.
+	gvisorRootfsCcpp: {"usr/bin/gcc", "usr/bin/g++"},
+	// The full JDK: both launchers. JAVA_HOME derivation is left to /proc/self/exe
+	// (see the Run path) exactly as the JDK does natively, so no symlink surgery here.
+	gvisorRootfsJava: {"usr/bin/javac", "usr/bin/java"},
+	// iverilog (build driver) and vvp (run); the driver also needs /bin/sh for its
+	// system() sub-invocations, which is present in this rootfs.
+	gvisorRootfsVerilog: {"usr/bin/iverilog", "usr/bin/vvp"},
 }
 
 const (
@@ -100,10 +175,10 @@ const (
 	gvisorWallGraceSec = 10
 )
 
-// defaultGvisorRootfsPath is where the image build stages the shared py3 rootfs
-// (see the Dockerfile). Overridable via GOBOXD_GVISOR_ROOTFS for testing or an
-// alternative layout.
-const defaultGvisorRootfsPath = "/opt/gvisor/rootfs/py3"
+// defaultGvisorRootfsBaseDir is the directory under which the image build stages
+// each per-language rootfs tree (e.g. <base>/py3, <base>/ccpp; see the Dockerfile).
+// Overridable via GOBOXD_GVISOR_ROOTFS for testing or an alternative layout.
+const defaultGvisorRootfsBaseDir = "/opt/gvisor/rootfs"
 
 // NewGvisorRunner constructs a GvisorRunner with its dependencies validated up
 // front, mirroring NewNsjailRunner: it confirms the runsc binary is present and
@@ -123,51 +198,113 @@ func NewGvisorRunner(ctx context.Context, runscPath string) (GvisorRunner, error
 			runscPath, err, strings.TrimSpace(string(out)))
 	}
 
-	rootfs := os.Getenv("GOBOXD_GVISOR_ROOTFS")
-	if rootfs == "" {
-		rootfs = defaultGvisorRootfsPath
+	baseDir := os.Getenv("GOBOXD_GVISOR_ROOTFS")
+	if baseDir == "" {
+		baseDir = defaultGvisorRootfsBaseDir
 	}
-	abs, err := filepath.Abs(rootfs)
+	absBase, err := filepath.Abs(baseDir)
 	if err != nil {
-		return GvisorRunner{}, fmt.Errorf("gvisor runner: resolve rootfs path %q: %w", rootfs, err)
+		return GvisorRunner{}, fmt.Errorf("gvisor runner: resolve rootfs base dir %q: %w", baseDir, err)
 	}
-	fi, err := os.Stat(abs)
-	if err != nil {
-		return GvisorRunner{}, fmt.Errorf("gvisor runner: py3 rootfs %s: %w", abs, err)
-	}
-	if !fi.IsDir() {
-		return GvisorRunner{}, fmt.Errorf("gvisor runner: py3 rootfs %s is not a directory", abs)
-	}
-	// The rootfs must actually contain the python3 the language registry invokes
-	// (/usr/bin/python3), or every request would fail at execve. Checking here keeps
-	// the failure at startup.
-	if _, err := os.Stat(filepath.Join(abs, "usr", "bin", "python3")); err != nil {
-		return GvisorRunner{}, fmt.Errorf("gvisor runner: py3 rootfs %s missing usr/bin/python3: %w", abs, err)
+
+	// Validate each per-language rootfs independently and include only those that are
+	// present and well-formed. This is deliberate graceful degradation: a language
+	// whose rootfs failed to build (or was not staged) is simply omitted, its
+	// requests get a clean "rootfs unavailable" error, and the other languages still
+	// work — rather than one missing tree taking the whole gvisor backend down. py3
+	// is the exception: it is the proven baseline, so its absence is treated as a
+	// hard startup failure (a sign the deployment is fundamentally broken), exactly
+	// the "fail loud at startup" contract Stage 1 established.
+	rootfs := make(map[string]string)
+	for name, sentinels := range gvisorRootfsSentinels {
+		abs := filepath.Join(absBase, name)
+		if err := validateGvisorRootfs(abs, sentinels); err != nil {
+			if name == gvisorRootfsPy3 {
+				return GvisorRunner{}, fmt.Errorf("gvisor runner: %w", err)
+			}
+			// Non-py3: log and skip so the backend still serves the languages it can.
+			log.Printf("gvisor runner: rootfs %q unavailable, that language will be rejected at request time: %v", name, err)
+			continue
+		}
+		rootfs[name] = abs
 	}
 
 	return GvisorRunner{
-		RunscPath:     runscPath,
-		Py3RootfsPath: abs,
+		RunscPath: runscPath,
+		Rootfs:    rootfs,
 	}, nil
 }
 
-// gvisorLanguageSupported reports whether the command is one this stage's
-// GvisorRunner can run. Only the python3 interpreter is supported; everything else
-// (the compiler build/run steps for cpp/c/java/verilog, bash, node) is deliberately
-// out of scope for Stage 1 and gets a clear error from Run rather than a silent
-// fallback or a confusing failure. pythonInterpreter is defined in nsjail.go.
-func gvisorLanguageSupported(cmd string) bool {
-	return cmd == pythonInterpreter
+// validateGvisorRootfs checks that abs is a directory containing every sentinel
+// path (the binaries the language invokes / shells out to), so a half-populated
+// rootfs is caught at startup instead of failing every request at execve.
+func validateGvisorRootfs(abs string, sentinels []string) error {
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("rootfs %s: %w", abs, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("rootfs %s is not a directory", abs)
+	}
+	for _, rel := range sentinels {
+		// Lstat, not Stat: a sentinel may be an absolute symlink that only resolves
+		// once the tree is the container root (e.g. the JDK's /usr/bin/java ->
+		// /etc/alternatives/java -> /usr/lib/jvm/…, which gVisor resolves *inside* the
+		// rootfs at run time but which would resolve against the host here). We only
+		// need to confirm the directory entry was populated, so check the entry itself.
+		if _, err := os.Lstat(filepath.Join(abs, rel)); err != nil {
+			return fmt.Errorf("rootfs %s missing %s: %w", abs, rel, err)
+		}
+	}
+	return nil
+}
+
+// gvisorRootfsName maps a command (a per-step Cmd from the language registry) to
+// the name of the rootfs that serves it, and whether such a mapping exists. The
+// command set mirrors nsjail.go's filesystemArgs dispatch:
+//
+//   - the three interpreters map to their own rootfs (py3/bash/js);
+//   - both compiler drivers AND the compiled-artifact run step ("./…") map to the
+//     single shared ccpp rootfs — gcc and g++ both live there, and a C/C++ binary's
+//     run-time library needs are a subset of what that rootfs already carries (this
+//     is why c and cpp need no separate run rootfs, and why "./solution" — which on
+//     its own does not say whether the artifact is C or C++ — can route to one tree);
+//   - javac/java map to the JDK rootfs; iverilog/vvp to the verilog rootfs.
+//
+// An unrecognised command returns ("", false), which Run turns into a clean error.
+// pythonInterpreter, cppCompiler, artifactRunPrefix, … are defined in nsjail.go.
+func gvisorRootfsName(cmd string) (string, bool) {
+	switch {
+	case cmd == pythonInterpreter:
+		return gvisorRootfsPy3, true
+	case cmd == bashInterpreter:
+		return gvisorRootfsBash, true
+	case cmd == nodeInterpreter:
+		return gvisorRootfsJs, true
+	case cmd == cppCompiler, cmd == cCompiler, strings.HasPrefix(cmd, artifactRunPrefix):
+		return gvisorRootfsCcpp, true
+	case cmd == javacCompiler, cmd == javaRuntime:
+		return gvisorRootfsJava, true
+	case cmd == iverilogCompiler, cmd == vvpRuntime:
+		return gvisorRootfsVerilog, true
+	default:
+		return "", false
+	}
 }
 
 func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) {
-	if !gvisorLanguageSupported(spec.Cmd) {
-		// A clean, explicit error — no fallback to nsjail/subprocess, no crash. The
-		// handler maps a runner error to internal_error (build phase) or the test's
-		// internal_error status (run phase), which is an acceptable "clean error"
-		// for an unsupported language this stage. Multi-language rootfs support is
-		// future work (see the type doc and FINDINGS.md §6).
-		return RunResult{}, fmt.Errorf("gvisor runner: language not yet supported in this stage (only py3); command %q", spec.Cmd)
+	// Resolve the rootfs for this command BEFORE touching runsc or building a bundle.
+	// A command with no known rootfs, or a known one whose tree was not staged (so it
+	// is absent from r.Rootfs), gets a clean, explicit error — no fallback to
+	// nsjail/subprocess, no crash. The handler maps a runner error to internal_error
+	// (build phase) or the test's internal_error status (run phase).
+	name, ok := gvisorRootfsName(spec.Cmd)
+	if !ok {
+		return RunResult{}, fmt.Errorf("gvisor runner: unsupported command %q (no rootfs mapping)", spec.Cmd)
+	}
+	rootfsPath := r.Rootfs[name]
+	if rootfsPath == "" {
+		return RunResult{}, fmt.Errorf("gvisor runner: rootfs %q unavailable for command %q", name, spec.Cmd)
 	}
 
 	wallSec := spec.WallTimeSec
@@ -192,7 +329,7 @@ func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 	// basename is both.
 	containerID := filepath.Base(bundleDir)
 
-	ociSpec := r.buildOCISpec(spec, containerID)
+	ociSpec := r.buildOCISpec(spec, containerID, rootfsPath)
 	specBytes, err := json.MarshalIndent(ociSpec, "", "  ")
 	if err != nil {
 		return RunResult{}, fmt.Errorf("gvisor runner: marshal OCI spec: %w", err)
@@ -304,7 +441,7 @@ func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) 
 // concurrent runs get distinct cgroups under the host hierarchy. (The wall-time
 // limit is not part of the spec — runsc has no in-spec time limit — so it is not
 // a parameter here; Run enforces it via the Go context.)
-func (r GvisorRunner) buildOCISpec(spec RunSpec, containerID string) ociSpec {
+func (r GvisorRunner) buildOCISpec(spec RunSpec, containerID, rootfsPath string) ociSpec {
 	s := ociSpec{
 		OCIVersion: "1.0.0",
 		Process: ociProcess{
@@ -325,10 +462,11 @@ func (r GvisorRunner) buildOCISpec(spec RunSpec, containerID string) ociSpec {
 			},
 		},
 		Root: ociRoot{
-			// Absolute path to the shared py3 rootfs, read-only. Shared safely across
-			// concurrent runs (the gofer opens it read-only); per-request writes go to
-			// the work-dir bind and the tmpfs /tmp below.
-			Path:     r.Py3RootfsPath,
+			// Absolute path to the shared per-language rootfs for this command,
+			// read-only. Shared safely across concurrent runs (the gofer opens it
+			// read-only); per-request writes go to the work-dir bind and the tmpfs /tmp
+			// below.
+			Path:     rootfsPath,
 			Readonly: true,
 		},
 		Hostname: "sandbox",

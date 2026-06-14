@@ -58,12 +58,13 @@ func sweepOrphanedJails(baseDir, prefix string, maxAge time.Duration) {
 }
 
 // selectRunner picks the sandbox implementation from the GOBOXD_RUNNER env var.
-// "nsjail" uses NsjailRunner; "gvisor" uses GvisorRunner (py3-only, Phase 7
-// Stage 1); anything else (including unset) keeps the SubprocessRunner default so
-// existing behavior is unchanged until a sandbox is explicitly opted into.
-// Constructing the nsjail and gvisor runners validates their dependencies up front
-// (nsjail resolves its mount profiles; gvisor probes the runsc binary and the
-// shared py3 rootfs), so each returns an error the caller should treat as fatal.
+// "nsjail" uses NsjailRunner; "gvisor" uses GvisorRunner (all 7 languages as of
+// Phase 7 Stage 2); anything else (including unset) keeps the SubprocessRunner
+// default so existing behavior is unchanged until a sandbox is explicitly opted
+// into. Constructing the nsjail and gvisor runners validates their dependencies up
+// front (nsjail resolves its mount profiles; gvisor probes the runsc binary and the
+// per-language rootfs trees), so each returns an error the caller should treat as
+// fatal.
 func selectRunner() (runner.Runner, error) {
 	switch os.Getenv("GOBOXD_RUNNER") {
 	case "nsjail":
