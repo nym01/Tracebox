@@ -6,6 +6,12 @@ services:
     environment:
       # Use the nsjail sandbox (not the SubprocessRunner fallback).
       GOBOXD_RUNNER: nsjail
+      # SQLite audit trail (Phase 5): persisted run data + trace events. Lives on
+      # the tracebox-data volume below so it survives container restarts.
+      TRACEBOX_DB_PATH: /data/tracebox.db
+    volumes:
+      # Persist the run-data SQLite DB across container restarts.
+      - tracebox-data:/data
     # The nsjail sandbox needs elevated access to set up namespaces, bind mounts
     # and the cgroup v2 memory limit:
     #   privileged   — nsjail creates mount/pid/net namespaces and applies the
@@ -16,3 +22,6 @@ services:
     #                  memory bombs would not be reported as memory_exceeded.
     privileged: true
     cgroup: host
+
+volumes:
+  tracebox-data:

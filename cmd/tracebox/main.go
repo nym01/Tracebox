@@ -12,8 +12,14 @@ import (
 	"github.com/nym01/goboxd/internal/api"
 	"github.com/nym01/goboxd/internal/language"
 	"github.com/nym01/goboxd/internal/runner"
+	"github.com/nym01/goboxd/internal/store"
 	"github.com/nym01/goboxd/internal/tracer"
 )
+
+// defaultDBPath is where run data is persisted when TRACEBOX_DB_PATH is unset.
+// In the container /data is a mounted volume (see docker-compose.yml) so the
+// audit trail survives restarts.
+const defaultDBPath = "/data/tracebox.db"
 
 // Commit is injected at build time via -ldflags "-X main.Commit=$(git rev-parse --short HEAD)".
 var Commit = "dev"
@@ -104,6 +110,22 @@ func main() {
 		defer t.Stop()
 		api.SetTracer(t)
 		log.Println("tracer: syscall tracing enabled (file-open + exec + connect)")
+	}
+
+	// Open the SQLite run store for the queryable audit trail (Phase 5). Like the
+	// tracer, this is additive: if it cannot be opened the server runs normally
+	// with persistence disabled (stdout logging is unaffected). GET /runs and
+	// GET /runs/{run_id} then report no data rather than failing.
+	dbPath := os.Getenv("TRACEBOX_DB_PATH")
+	if dbPath == "" {
+		dbPath = defaultDBPath
+	}
+	if st, err := store.Open(dbPath); err != nil {
+		log.Printf("store: run persistence disabled: %v", err)
+	} else {
+		defer st.Close()
+		api.SetStore(st)
+		log.Printf("store: run persistence enabled (%s)", dbPath)
 	}
 
 	api.InitReadyz(nsjailPath)

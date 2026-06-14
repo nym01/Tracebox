@@ -44,6 +44,8 @@ func RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /readyz", readyzHandler)
 	mux.HandleFunc("GET /info", infoHandler)
 	mux.HandleFunc("POST /run", run)
+	mux.HandleFunc("GET /runs", listRunsHandler)
+	mux.HandleFunc("GET /runs/{run_id}", getRunHandler)
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
@@ -303,15 +305,18 @@ func run(w http.ResponseWriter, r *http.Request) {
 				notExecuted[i] = TestResult{Status: status.NotExecuted}
 			}
 			topStatus := status.TopLevel(bstatus, nil)
+			durationMs := time.Since(runStart).Milliseconds()
+			timestamp := time.Now().Format(time.RFC3339)
 			emitTraceEvents(runID, traceRun)
 			emitRunLog(runLog{
 				RunID:      runID,
 				Language:   req.Language,
 				Status:     topStatus,
 				ExitCode:   bres.ExitCode,
-				DurationMs: time.Since(runStart).Milliseconds(),
-				Timestamp:  time.Now().Format(time.RFC3339),
+				DurationMs: durationMs,
+				Timestamp:  timestamp,
 			})
+			persistRun(r.Context(), runID, req.Language, topStatus, bres.ExitCode, durationMs, timestamp, req.Source, buildResult, notExecuted, traceRun)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RunResponse{
 				RunID:  runID,
@@ -389,15 +394,18 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 	topStatus := status.TopLevel(status.BuildOK, testStatuses)
 
+	durationMs := time.Since(runStart).Milliseconds()
+	timestamp := time.Now().Format(time.RFC3339)
 	emitTraceEvents(runID, traceRun)
 	emitRunLog(runLog{
 		RunID:      runID,
 		Language:   req.Language,
 		Status:     topStatus,
 		ExitCode:   runExitCode,
-		DurationMs: time.Since(runStart).Milliseconds(),
-		Timestamp:  time.Now().Format(time.RFC3339),
+		DurationMs: durationMs,
+		Timestamp:  timestamp,
 	})
+	persistRun(r.Context(), runID, req.Language, topStatus, runExitCode, durationMs, timestamp, req.Source, buildResult, testResults, traceRun)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(RunResponse{RunID: runID, Status: topStatus, Build: buildResult, Tests: testResults})
