@@ -134,6 +134,10 @@ func run(args []string) int {
 		return exitRan
 	case "run":
 		return runCommand(args[1:])
+	case "start":
+		return startCommand(args[1:])
+	case "stop":
+		return stopCommand(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "tracebox: unknown command %q\n\n", args[0])
 		usage(os.Stderr)
@@ -458,14 +462,27 @@ func usage(w io.Writer) {
 
 Usage:
   tracebox run <file> [--stdin "input" | --stdin-file path]
+  tracebox start [--strict]
+  tracebox stop
 
-The language is detected from the file extension and the code is sent to the
-Tracebox API (POST /run). The program's stdout/stderr and a plain-English
-explanation of the result are printed.
+run    Send a source file to the Tracebox API (POST /run) and print its
+       stdout/stderr plus a plain-English explanation. The language is detected
+       from the file extension.
+start  Start the sandbox (docker compose up -d --build) from anywhere. Default
+       uses the nsjail backend; --strict uses the stronger-isolation gVisor
+       backend (GOBOXD_RUNNER=gvisor). Waits until the API is healthy.
+stop   Stop the sandbox (docker compose down).
 
-Flags:
+start/stop locate the repo's docker-compose.yml from a config file written by
+tracebox.ps1 / tracebox.sh during setup (~/.tracebox/config). If that file is
+missing, run the setup script from the repo once to create it.
+
+Flags (run):
   --stdin S          feed S to the program's standard input
   --stdin-file PATH  feed the contents of PATH to standard input
+
+Flags (start):
+  --strict           use the gVisor backend instead of the nsjail default
 
 Environment:
   TRACEBOX_API_URL   base URL of the Tracebox API (default http://localhost:8080)

@@ -4,8 +4,12 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Use the nsjail sandbox (not the SubprocessRunner fallback).
-      GOBOXD_RUNNER: nsjail
+      # Sandbox backend. Defaults to the nsjail sandbox (not the SubprocessRunner
+      # fallback). `tracebox start --strict` sets GOBOXD_RUNNER=gvisor in the
+      # environment to start the stronger-isolation gVisor backend instead; a
+      # plain `docker compose up` (or `tracebox start`) leaves it unset and so
+      # gets nsjail via the default below.
+      GOBOXD_RUNNER: ${GOBOXD_RUNNER:-nsjail}
       # SQLite audit trail (Phase 5): persisted run data + trace events. Lives on
       # the tracebox-data volume below so it survives container restarts.
       TRACEBOX_DB_PATH: /data/tracebox.db

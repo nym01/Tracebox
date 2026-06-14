@@ -53,7 +53,12 @@ the binary and sets up your `PATH` for you:
 
 ```sh
 tracebox run <file> [--stdin "input" | --stdin-file path]
+tracebox start [--strict]
+tracebox stop
 ```
+
+`run` sends a source file to the API. `start` / `stop` bring the sandbox itself
+up and down (see [Managing the sandbox](#managing-the-sandbox-start--stop)).
 
 The language is detected from the file extension:
 
@@ -109,6 +114,51 @@ The CLI prints, as applicable:
 
 The explanation wording matches the web UI (`web/src/explain.ts`) and the MCP
 server, so all three describe results the same way.
+
+## Managing the sandbox (`start` / `stop`)
+
+`tracebox run` talks to a sandbox API that must already be running. After the
+initial setup (`tracebox.ps1` / `tracebox.sh`), you can start and stop that
+sandbox from **any directory** — no need to re-run the full setup script or
+`cd` back into the repo:
+
+```sh
+tracebox start            # start the sandbox (nsjail backend, the default)
+tracebox start --strict   # start with the gVisor backend (stronger isolation, slower)
+tracebox stop             # stop the sandbox
+```
+
+- **`start`** runs `docker compose up -d --build` and waits (up to 120s) for the
+  API's `/healthz` and `/readyz` endpoints, then prints which mode it came up in.
+- **`start --strict`** sets `GOBOXD_RUNNER=gvisor` so the sandbox uses the
+  gVisor (runsc) backend — the stronger-isolation, slower mode. Without
+  `--strict`, the default nsjail backend is used.
+- **`stop`** runs `docker compose down`.
+
+Both check that Docker is installed and running first, with a friendly error if
+it isn't.
+
+### How `start`/`stop` find the repo
+
+The `tracebox` binary is on your `PATH` and has no built-in knowledge of where
+the repo (and its `docker-compose.yml`) lives. The setup scripts record the
+repo's absolute path in a small config file the first time you run them:
+
+| OS            | Config file                       |
+| ------------- | --------------------------------- |
+| Windows       | `%USERPROFILE%\.tracebox\config`  |
+| Linux / macOS | `~/.tracebox/config`              |
+
+It is a plain `key=value` text file:
+
+```
+repo_path=/absolute/path/to/Tracebox
+```
+
+If this file is missing (the CLI was installed but the setup script was never
+run here, or it ran on a different machine), `tracebox start` / `tracebox stop`
+print a clear message telling you to run `tracebox.ps1` / `tracebox.sh` from the
+repo once to create it.
 
 ## Configuration
 

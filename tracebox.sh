@@ -8,7 +8,8 @@
 #   4. Builds and installs the tracebox CLI onto your PATH.
 #   5. Builds the tracebox-mcp MCP server.
 #   6. Registers the MCP server with Claude Code (if the `claude` CLI is found).
-#   7. Prints a summary of what was set up.
+#   7. Records the repo location so `tracebox start`/`tracebox stop` work anywhere.
+#   8. Prints a summary of what was set up.
 #
 # Safe to re-run: existing containers, an already-installed CLI and an
 # already-registered MCP server are detected and left alone / updated.
@@ -30,7 +31,7 @@ if [ -t 1 ]; then
 else
     C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_OFF=''
 fi
-step() { printf '\n%s[%s/7] %s%s\n' "$C_CYAN" "$1" "$2" "$C_OFF"; }
+step() { printf '\n%s[%s/8] %s%s\n' "$C_CYAN" "$1" "$2" "$C_OFF"; }
 ok()   { printf '%s  OK  %s%s\n' "$C_GREEN" "$1" "$C_OFF"; }
 info() { printf '      %s\n' "$1"; }
 warn() { printf '%s  !!  %s%s\n' "$C_YELLOW" "$1" "$C_OFF"; }
@@ -197,7 +198,19 @@ else
     fi
 fi
 
-# --- 7. Summary. -----------------------------------------------------------
+# --- 7. Record the repo location for `tracebox start`/`tracebox stop`. ------
+# The CLI binary lives on the PATH and can be invoked from anywhere, but it has
+# no built-in knowledge of where this repo (and its docker-compose.yml) lives.
+# Record the absolute repo path in a small config file so `tracebox start` and
+# `tracebox stop` can locate the compose project from any directory.
+step 7 "Recording the repo location for tracebox start/stop..."
+CONFIG_DIR="$HOME/.tracebox"
+CONFIG_FILE="$CONFIG_DIR/config"
+mkdir -p "$CONFIG_DIR"
+printf 'repo_path=%s\n' "$SCRIPT_DIR" > "$CONFIG_FILE"
+ok "Recorded repo path in $CONFIG_FILE"
+
+# --- 8. Summary. -----------------------------------------------------------
 printf '\n========================================\n'
 printf '%s Tracebox setup complete%s\n' "$C_GREEN" "$C_OFF"
 printf '========================================\n'
@@ -210,6 +223,10 @@ case "$MCP_STATUS" in
 esac
 printf '\nYou can now run scripts in the sandbox from any directory:\n'
 printf '    tracebox run script.py\n'
+printf '\nManage the sandbox from any directory (no need to re-run this script):\n'
+printf '    tracebox start            start the sandbox (nsjail, default)\n'
+printf '    tracebox start --strict   start with the gVisor backend (stronger isolation)\n'
+printf '    tracebox stop             stop the sandbox\n'
 if [ "$PATH_HINT" -eq 1 ]; then
     warn "Restart your terminal (or update PATH as shown above) so 'tracebox' is found."
 fi

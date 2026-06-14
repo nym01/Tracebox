@@ -7,7 +7,8 @@
 #   4. Builds and installs the tracebox CLI onto your user PATH.
 #   5. Builds the tracebox-mcp MCP server.
 #   6. Registers the MCP server with Claude Code (if the `claude` CLI is found).
-#   7. Prints a summary of what was set up.
+#   7. Records the repo location so `tracebox start`/`tracebox stop` work anywhere.
+#   8. Prints a summary of what was set up.
 #
 # Safe to re-run: existing containers, an already-installed CLI and an
 # already-registered MCP server are detected and left alone / updated.
@@ -22,7 +23,7 @@ $ApiUrl    = "http://localhost:8080"
 $CliBinary = "tracebox.exe"
 $McpBinary = "tracebox-mcp.exe"
 
-function Write-Step($n, $msg) { Write-Host "`n[$n/7] $msg" -ForegroundColor Cyan }
+function Write-Step($n, $msg) { Write-Host "`n[$n/8] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)       { Write-Host "  OK  $msg"  -ForegroundColor Green }
 function Write-Info($msg)     { Write-Host "      $msg" }
 function Write-Warn2($msg)    { Write-Host "  !!  $msg"  -ForegroundColor Yellow }
@@ -191,7 +192,23 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
     }
 }
 
-# --- 7. Summary. -----------------------------------------------------------
+# --- 7. Record the repo location for `tracebox start`/`tracebox stop`. ------
+# The CLI binary lives on the PATH and can be invoked from anywhere, but it has
+# no built-in knowledge of where this repo (and its docker-compose.yml) lives.
+# Record the absolute repo path in a small config file so `tracebox start` and
+# `tracebox stop` can locate the compose project from any directory.
+Write-Step 7 "Recording the repo location for tracebox start/stop..."
+$ConfigDir  = Join-Path $env:USERPROFILE ".tracebox"
+$ConfigFile = Join-Path $ConfigDir "config"
+if (-not (Test-Path $ConfigDir)) {
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+}
+# Write a simple key=value config (UTF-8, no BOM) recording the repo path.
+$ConfigContent = "repo_path=$RepoRoot`n"
+[System.IO.File]::WriteAllText($ConfigFile, $ConfigContent, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok "Recorded repo path in $ConfigFile"
+
+# --- 8. Summary. -----------------------------------------------------------
 Write-Host "`n========================================" -ForegroundColor White
 Write-Host " Tracebox setup complete" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor White
@@ -203,6 +220,11 @@ else                  { Write-Host "  MCP server  : built; automatic registratio
 Write-Host ""
 Write-Host "You can now run scripts in the sandbox from any directory:"
 Write-Host "    tracebox run script.py"
+Write-Host ""
+Write-Host "Manage the sandbox from any directory (no need to re-run this script):"
+Write-Host "    tracebox start            start the sandbox (nsjail, default)"
+Write-Host "    tracebox start --strict   start with the gVisor backend (stronger isolation)"
+Write-Host "    tracebox stop             stop the sandbox"
 if ($PathChanged) {
     Write-Warn2 "Open a NEW terminal first so the updated PATH takes effect."
 }
