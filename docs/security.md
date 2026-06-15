@@ -121,13 +121,98 @@ loopback interface.
 **Analogy:** the room has no doors, windows, phone, Wi-Fi, or internet
 connection. The code can talk to itself, but not to the outside world.
 
+## A Real Gap We Found: The clone/clone3 Seccomp Gap (Finding A)
+
+The deny-list limitation discussed later isn't just theoretical — we found a
+real example of it during an audit, and fixing it properly took more thought
+than it first appeared.
+
+`unshare` was originally blocked because it can create a new user namespace.
+That's dangerous because a process can become "root" inside that namespace,
+opening up privilege-escalation possibilities.
+
+While investigating this, we found that `clone` and `clone3` could create the
+same type of namespaces using the same dangerous flags. In other words,
+blocking `unshare` alone didn't really solve the problem — it was like locking
+the front door while leaving the back door open.
+
+The obvious fix — blocking `clone`/`clone3` entirely — would break a lot of
+normal applications. Programs like Java (JVM), Node.js, and many other modern
+runtimes use `clone` constantly to create threads. Blocking it outright would
+cause legitimate workloads to fail.
+
+The fix ended up being different for each syscall:
+
+- **`clone`** — argument filtering. The syscall is only blocked when called
+  with the dangerous namespace-related flags; in that case it returns
+  `SIGSYS` and the process is terminated.
+- **`clone3`** — argument filtering isn't practical, because its flags live
+  inside a structure passed by pointer, which seccomp can't inspect. Instead,
+  `clone3` returns `ENOSYS` ("function not implemented"). Well-behaved
+  programs then fall back to the older `clone` syscall, where the argument
+  filtering is already in place.
+
+This closes the namespace-creation path without breaking normal thread
+creation.
+
+## A Stronger Alternative: The gVisor Backend (`--strict`)
+
+In simple terms, gVisor puts a fake kernel between the sandboxed program and
+the real Linux kernel.
+
+Normally, a program running inside nsjail still talks to the real kernel,
+just with heavy restrictions applied. With gVisor, the program instead talks
+to a userspace component called the "sentry," which acts like a kernel and
+handles most system calls itself. The sandboxed program never interacts
+directly with the real kernel.
+
+This was built to close a real leak: under nsjail, programs can still read
+`/proc` and see real details about the host machine — CPU model, available
+memory, kernel version. gVisor solves this by generating its own virtual
+`/proc` values. Instead of exposing real host information, the sentry makes
+up its own, so the leak disappears.
+
+The tradeoff is performance. Starting a gVisor sandbox takes longer because
+the sentry has to be created first — roughly 40ms of overhead for a normal
+nsjail run versus roughly 200-250ms for gVisor.
+
+Enable this mode with:
+
+```
+tracebox start --strict
+```
+
+**Analogy:** nsjail is like letting someone into your house but restricting
+which rooms they can access. gVisor is like letting them into a realistic
+replica of your house instead — they can interact with it normally, but they
+never reach the real thing.
+
+## gVisor's Own Honest Weakness (G1)
+
+gVisor isn't strictly better than nsjail in every way — and finding that out
+is part of what makes this comparison credible.
+
+With nsjail, a process limit can be enforced, preventing a program from
+creating too many processes or threads (protecting against fork bombs). Under
+gVisor, that limit wasn't enforced in testing — a sandboxed program could
+create hundreds of processes without hitting a process-count restriction.
+
+Fixing this turned out to be risky: setting a tight process limit caused the
+gVisor sandbox itself to fail during startup, because the sentry appears to
+need some processes and threads of its own just to operate. Forcing a strict
+limit risked breaking gVisor mode entirely, and the exact threshold seemed
+environment-dependent — so a fix here could introduce instability elsewhere
+without truly closing the gap.
+
+This doesn't mean a fork bomb runs forever, though. Memory limits are still
+enforced, and every new process consumes memory — so the sandbox eventually
+hits its memory cap and gets terminated.
+
+**Analogy:** there's no direct limit on how many people can enter a room, but
+there's still a limit on the room's size. Once the room is full, no more
+people can fit inside.
+
 ## How Security Could Be Improved Further
-
-**gVisor** adds another layer between the sandbox and the Linux kernel.
-Instead of talking directly to the kernel, programs talk to gVisor first.
-
-**Analogy:** instead of speaking directly to the bank manager, every request
-goes through a security guard.
 
 **Firecracker** runs each workload inside its own lightweight virtual
 machine, with its own kernel.
@@ -152,21 +237,26 @@ biggest fundamental limitation.
 
 **3. Seccomp uses a deny-list.** Tracebox blocks known dangerous system
 calls, but any dangerous syscall that developers forgot to block is allowed
-by default. An allow-list would be stricter but harder to maintain across
-many programming languages.
+by default. Finding A above is a real example of this kind of gap. An
+allow-list would be stricter but harder to maintain across many programming
+languages.
 
 **4. No strict disk usage quota.** Individual files are limited in size, but
 a program can still create many small files and fill up storage. Current
 mitigation: temporary directories are cleaned up and concurrent workloads
 are limited.
 
-**5. Some host information leaks through `/proc`.** Programs can still see
-information such as CPU model, amount of RAM, kernel version, and system
-load. This does not allow escaping the sandbox — it only reveals information
-about the machine.
+**5. Some host information leaks through `/proc` (nsjail only).** Programs
+can still see information such as CPU model, amount of RAM, kernel version,
+and system load. This does not allow escaping the sandbox — it only reveals
+information about the machine. The gVisor backend (above) closes this leak.
 
 **Analogy:** someone cannot enter your house, but they can look through the
 window and see what model of TV you own.
+
+**6. gVisor's process limit isn't enforced (G1, above).** This is gVisor's
+own honest weakness — memory limits provide a backstop, but not the same
+direct, immediate protection nsjail's process limit gives.
 
 ## Bottom Line
 
@@ -176,9 +266,13 @@ Tracebox protects itself using three layers:
 - **Syscall filtering** — dangerous operating system actions are blocked.
 - **Resource limits** — memory, CPU, and process abuse are restricted.
 
-Together these create a strong sandbox for running untrusted code.
+Together these create a strong sandbox for running untrusted code. Two
+different backends — nsjail (default) and gVisor (`--strict`) — implement
+this with different tradeoffs: nsjail is faster but shares the real kernel
+under restriction; gVisor is slower but replaces the kernel entirely with its
+own sentry, closing some leaks at the cost of its own (different) weaknesses.
 
 The biggest remaining risk is not the configuration itself, but the shared
-Linux kernel underneath everything. Stronger options like gVisor or
-Firecracker would reduce that risk further, but at the cost of additional
-complexity and performance overhead.
+Linux kernel underneath everything for the nsjail backend. Stronger options
+like Firecracker would reduce that risk further, but at the cost of
+additional complexity and performance overhead.
