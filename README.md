@@ -7,6 +7,9 @@ sandbox, watches everything it does at the syscall level, and keeps a record
 you can replay. Built mainly so you can let an AI agent run code it wrote
 without worrying about what that code might actually do.
 
+
+![Tracebox architecture](docs/images/architecture.gif)
+
 ## Quick Start
 
 The only requirement is [Docker](https://docs.docker.com/get-docker/) (with
