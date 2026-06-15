@@ -89,9 +89,10 @@ type runRequest struct {
 }
 
 type buildResult struct {
-	Status string `json:"status"`
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
+	Status     string `json:"status"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 type testResult struct {
@@ -100,13 +101,15 @@ type testResult struct {
 	Stderr       string `json:"stderr"`
 	DurationMs   int64  `json:"duration_ms"`
 	MemoryPeakKB int64  `json:"memory_peak_kb"`
+	ExitCode     int    `json:"exit_code"`
 }
 
 type runResponse struct {
-	RunID  string       `json:"run_id"`
-	Status string       `json:"status"`
-	Build  *buildResult `json:"build,omitempty"`
-	Tests  []testResult `json:"tests"`
+	RunID   string       `json:"run_id"`
+	Status  string       `json:"status"`
+	Build   *buildResult `json:"build,omitempty"`
+	Tests   []testResult `json:"tests"`
+	Backend string       `json:"backend"`
 }
 
 type apiError struct {
@@ -152,11 +155,14 @@ func runCommand(args []string) int {
 		stdin     string
 		stdinSet  bool
 		stdinFile string
+		verbose   bool
 	)
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case arg == "--verbose" || arg == "-v":
+			verbose = true
 		case arg == "--stdin":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "tracebox: --stdin requires a value")
@@ -249,7 +255,7 @@ func runCommand(args []string) int {
 	if code != exitRan {
 		return code
 	}
-	return report(resp)
+	return report(resp, verbose)
 }
 
 // postRun sends the request and decodes the response. The returned exit code is
@@ -300,46 +306,10 @@ func postRun(apiURL string, reqBody runRequest) (*runResponse, int) {
 	return &rr, exitRan
 }
 
-// report prints the program output and a plain-English explanation, then
-// returns the process exit code derived from the run status.
-func report(rr *runResponse) int {
-	var test *testResult
-	if len(rr.Tests) > 0 {
-		test = &rr.Tests[0]
-	}
-
-	// On a build failure, the compiler output is the most useful thing to show.
-	if rr.Build != nil && rr.Build.Status != "build_ok" {
-		out := joinOutput(rr.Build.Stdout, rr.Build.Stderr)
-		if out != "" {
-			fmt.Println("=== compile output ===")
-			fmt.Println(strings.TrimRight(out, "\n"))
-		}
-	}
-
-	if test != nil {
-		if test.Stdout != "" {
-			fmt.Println("=== stdout ===")
-			fmt.Println(strings.TrimRight(test.Stdout, "\n"))
-		}
-		if test.Stderr != "" {
-			fmt.Println("=== stderr ===")
-			fmt.Println(strings.TrimRight(test.Stderr, "\n"))
-		}
-	}
-
-	expl := explain(rr.Status)
-	fmt.Println("===")
-	fmt.Printf("%s: %s\n", expl.label, expl.detail)
-	fmt.Printf("run_id: %s\n", rr.RunID)
-	if test != nil {
-		fmt.Printf("duration: %dms", test.DurationMs)
-		if test.MemoryPeakKB > 0 {
-			fmt.Printf("  memory: %dKB", test.MemoryPeakKB)
-		}
-		fmt.Println()
-	}
-
+// report renders the run (see render.go) to stdout and returns the process exit
+// code derived from the run status. verbose adds the long explanation paragraph.
+func report(rr *runResponse, verbose bool) int {
+	renderRun(os.Stdout, newStyler(os.Stdout), rr, verbose)
 	return exitCodeFor(rr.Status)
 }
 
@@ -375,14 +345,14 @@ func explain(status string) explanation {
 	if ranStatuses[status] {
 		return explanation{
 			label:  "ran successfully",
-			detail: "The program executed to completion inside the sandbox. Its output is shown above; this isn't checked against any expected answer, so a clean run just means it finished without errors.",
+			detail: "The program executed to completion inside the sandbox. Its output is shown below; this isn't checked against any expected answer, so a clean run just means it finished without errors.",
 		}
 	}
 	switch status {
 	case "runtime_error":
 		return explanation{
 			label:  "crashed",
-			detail: "The program exited with a non-zero status or was terminated by the sandbox. Check the standard error output above for the cause — an exception, a failed assertion, or a blocked operation.",
+			detail: "The program exited with a non-zero status or was terminated by the sandbox. Check the standard error output below for the cause — an exception, a failed assertion, or a blocked operation.",
 		}
 	case "time_exceeded":
 		return explanation{
@@ -397,7 +367,7 @@ func explain(status string) explanation {
 	case "build_failed":
 		return explanation{
 			label:  "failed to compile",
-			detail: "The compiler rejected the code before it could run. The compile output above shows the errors — fix those and run again.",
+			detail: "The compiler rejected the code before it could run. The compile output below shows the errors — fix those and run again.",
 		}
 	case "internal_error":
 		return explanation{
@@ -412,7 +382,7 @@ func explain(status string) explanation {
 	default:
 		return explanation{
 			label:  strings.ReplaceAll(status, "_", " "),
-			detail: "The run finished with this status; see the output above for details.",
+			detail: "The run finished with this status; see the output below for details.",
 		}
 	}
 }
@@ -480,6 +450,10 @@ missing, run the setup script from the repo once to create it.
 Flags (run):
   --stdin S          feed S to the program's standard input
   --stdin-file PATH  feed the contents of PATH to standard input
+  -v, --verbose      show the full plain-English explanation of the result
+
+Output is colored with boxed stdout/stderr on a terminal; set NO_COLOR or pipe
+the output elsewhere to get plain text instead.
 
 Flags (start):
   --strict           use the gVisor backend instead of the nsjail default

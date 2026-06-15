@@ -13,6 +13,9 @@ const outputCap = 64 * 1024
 // SubprocessRunner is the Stage 1 implementation: plain exec.Cmd + context timeout.
 type SubprocessRunner struct{}
 
+// Backend names the sandbox implementation for reporting (see handlers' backendName).
+func (SubprocessRunner) Backend() string { return "subprocess" }
+
 func (SubprocessRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) {
 	wallSec := spec.WallTimeSec
 	if wallSec <= 0 {

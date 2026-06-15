@@ -325,6 +325,9 @@ func gvisorRootfsName(cmd string) (string, bool) {
 	}
 }
 
+// Backend names the sandbox implementation for reporting (see handlers' backendName).
+func (r GvisorRunner) Backend() string { return "gvisor" }
+
 func (r GvisorRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) {
 	// Resolve the rootfs for this command BEFORE touching runsc or building a bundle.
 	// A command with no known rootfs, or a known one whose tree was not staged (so it

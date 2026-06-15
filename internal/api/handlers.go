@@ -81,6 +81,10 @@ type TestResult struct {
 	Stderr       string `json:"stderr"`
 	DurationMs   int64  `json:"duration_ms"`
 	MemoryPeakKB int64  `json:"memory_peak_kb"`
+	// ExitCode is the sandboxed program's process exit status (0 for a clean
+	// exit). It is purely informational for clients; the run verdict lives in
+	// Status, which already folds a non-zero exit into runtime_error.
+	ExitCode int `json:"exit_code"`
 }
 
 type RunResponse struct {
@@ -88,6 +92,20 @@ type RunResponse struct {
 	Status string       `json:"status"`
 	Build  *BuildResult `json:"build,omitempty"`
 	Tests  []TestResult `json:"tests"`
+	// Backend names the sandbox implementation that executed the run
+	// ("subprocess", "nsjail", or "gvisor"), so clients can show which
+	// isolation layer the code actually ran inside. See backendName.
+	Backend string `json:"backend"`
+}
+
+// backendName reports the sandbox implementation behind r ("subprocess",
+// "nsjail", or "gvisor"). The real runners expose Backend(); test fakes and any
+// other Runner that doesn't are reported as the default "subprocess".
+func backendName(r runner.Runner) string {
+	if b, ok := r.(interface{ Backend() string }); ok {
+		return b.Backend()
+	}
+	return "subprocess"
 }
 
 // runLog is the structured JSON log line emitted to stdout when a run completes.
@@ -284,6 +302,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rr := defaultRunner
+	backend := backendName(rr)
 
 	// Build phase — compiled languages only.
 	var buildResult *BuildResult
@@ -344,10 +363,11 @@ func run(w http.ResponseWriter, r *http.Request) {
 			persistRun(r.Context(), runID, req.Language, topStatus, bres.ExitCode, durationMs, timestamp, req.Source, buildResult, notExecuted, events)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RunResponse{
-				RunID:  runID,
-				Status: topStatus,
-				Build:  buildResult,
-				Tests:  notExecuted,
+				RunID:   runID,
+				Status:  topStatus,
+				Build:   buildResult,
+				Tests:   notExecuted,
+				Backend: backend,
 			})
 			return
 		}
@@ -411,6 +431,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 			Stderr:       result.Stderr,
 			DurationMs:   result.DurationMs,
 			MemoryPeakKB: result.MemoryPeakKB,
+			ExitCode:     result.ExitCode,
 		}
 	}
 
@@ -435,7 +456,7 @@ func run(w http.ResponseWriter, r *http.Request) {
 	persistRun(r.Context(), runID, req.Language, topStatus, runExitCode, durationMs, timestamp, req.Source, buildResult, testResults, events)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(RunResponse{RunID: runID, Status: topStatus, Build: buildResult, Tests: testResults})
+	json.NewEncoder(w).Encode(RunResponse{RunID: runID, Status: topStatus, Build: buildResult, Tests: testResults, Backend: backend})
 }
 
 func resolveTokens(s, sourceFile, artifactFile string) string {

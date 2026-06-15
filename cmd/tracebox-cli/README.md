@@ -104,16 +104,28 @@ TRACEBOX_API_URL=https://tracebox.example.com tracebox run script.js
 
 ### Output
 
-The CLI prints, as applicable:
+On a terminal the CLI prints, as applicable:
 
-- `=== compile output ===` — the compiler's errors (on build failure).
-- `=== stdout ===` / `=== stderr ===` — the program's output streams.
-- A one-line plain-English explanation ("ran successfully", "crashed",
-  "took too long", "used too much memory", "failed to compile", ...).
-- The `run_id` and the run's duration (and peak memory when reported).
+- A short status line that names the sandbox — e.g.
+  `✓ ran successfully in Tracebox sandbox (no expected output provided)` or
+  `✗ crashed in Tracebox sandbox`. The wording ("ran successfully", "crashed",
+  "took too long", "used too much memory", "failed to compile", ...) matches the
+  web UI (`web/src/explain.ts`) and the MCP server.
+- The program's output in a bordered, colored box labeled `OUTPUT` (cyan); a
+  separate red `STDERR` box below it when standard error is non-empty; and a red
+  `COMPILE ERRORS` box on a build failure. Box content keeps the program's own
+  colors — only the border and label are colored.
+- A dimmed metadata line: `run_id`, the sandbox backend that executed the run
+  (`nsjail` / `gvisor` / `subprocess`), the program's exit code, the run's
+  duration, and peak memory when reported.
 
-The explanation wording matches the web UI (`web/src/explain.ts`) and the MCP
-server, so all three describe results the same way.
+Pass `-v` / `--verbose` to also print the full plain-English explanation
+paragraph above the output.
+
+Colors and box-drawing are used only when stdout is an interactive terminal.
+When output is piped to a file or another program, or when `NO_COLOR` is set (or
+`TERM=dumb`), the CLI falls back to a plain-text layout — `=== OUTPUT ===` /
+`=== STDERR ===` headers and a `key: value` metadata line — with no escape codes.
 
 ## Managing the sandbox (`start` / `stop`)
 

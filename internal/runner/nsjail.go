@@ -234,6 +234,9 @@ func NewNsjailRunner(ctx context.Context, nsjailPath string) (NsjailRunner, erro
 	}, nil
 }
 
+// Backend names the sandbox implementation for reporting (see handlers' backendName).
+func (r NsjailRunner) Backend() string { return "nsjail" }
+
 func (r NsjailRunner) Run(ctx context.Context, spec RunSpec) (RunResult, error) {
 	wallSec := spec.WallTimeSec
 	if wallSec <= 0 {
