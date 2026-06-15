@@ -5,13 +5,22 @@ package main
 // the standing-operation counterpart to re-running the full tracebox.ps1 /
 // tracebox.sh setup script every time.
 //
-// The CLI binary does not know where the Tracebox repo (and its
-// docker-compose.yml) lives, so the setup scripts record the repo's absolute path
-// in a small config file (see configPath / repoConfigKey). start/stop read that
-// file to locate the compose project. If the file is missing — the CLI was
-// installed but the setup script never ran here, or it ran on a different machine —
-// the user gets a clear "run the setup script once" message rather than a cryptic
-// failure.
+// The CLI binary does not know where the Tracebox compose project lives, so the
+// setup scripts record its location in a small config file (see configPath). Two
+// install shapes are supported, distinguished by which key the config carries:
+//
+//   repo_path     — REPO mode (git clone + build from source). Points at the repo
+//                   directory; start builds the image locally (docker compose
+//                   --build) from the repo's Dockerfile.
+//   compose_file  — STANDALONE mode (no-clone, no-Go). Points directly at the
+//                   minimal ~/.tracebox/docker-compose.yml the setup script wrote,
+//                   which references the prebuilt ghcr.io/nym01/tracebox image;
+//                   start pulls that image instead of building.
+//
+// compose_file takes precedence if both are present. start/stop read this to
+// locate the compose project. If the file is missing — the CLI was installed but
+// the setup script never ran here, or it ran on a different machine — the user
+// gets a clear "run the setup script once" message rather than a cryptic failure.
 //
 // Like the rest of the CLI this stays a thin wrapper: it shells out to the same
 // `docker compose` the setup scripts use and polls the same /healthz + /readyz
@@ -28,10 +37,14 @@ import (
 	"time"
 )
 
-// repoConfigKey is the key, in the ~/.tracebox/config file, under which the setup
-// scripts record the absolute path of the Tracebox repo (the directory containing
-// docker-compose.yml). The file is a simple `key=value` text file, one per line.
-const repoConfigKey = "repo_path"
+// Config keys recorded in the ~/.tracebox/config file (a simple `key=value` text
+// file, one per line). repoConfigKey is written by a git-clone setup (REPO mode);
+// composeConfigKey is written by a standalone setup (STANDALONE mode). See the
+// file-level comment for how they differ.
+const (
+	repoConfigKey    = "repo_path"
+	composeConfigKey = "compose_file"
+)
 
 // healthTimeout bounds how long `tracebox start` waits for the API to become
 // healthy after the containers come up. Matches the 120s used by tracebox.ps1 /
@@ -48,25 +61,37 @@ func configPath() (string, error) {
 	return filepath.Join(home, ".tracebox", "config"), nil
 }
 
-// readRepoPath reads the recorded repo path from the config file. A missing config
-// file (the common "never set up here" case) returns a descriptive error pointing
-// the user at the setup script; the caller turns that into a friendly message.
-func readRepoPath() (string, error) {
+// composeConfig describes a resolved Tracebox compose project: where its
+// docker-compose.yml is, what directory docker compose should treat as the
+// project root, and whether `start` builds the image from source (repo mode) or
+// runs the prebuilt published image (standalone mode).
+type composeConfig struct {
+	composeFile string // absolute path to docker-compose.yml (-f)
+	projectDir  string // --project-directory
+	build       bool   // true => `up --build` (repo mode); false => pull published image
+}
+
+// readComposeConfig reads ~/.tracebox/config and resolves the compose project.
+// compose_file (standalone mode) wins over repo_path (repo mode) if both are set.
+// A missing config file (the common "never set up here" case) returns a
+// descriptive error pointing the user at the setup script; the caller turns that
+// into a friendly message.
+func readComposeConfig() (composeConfig, error) {
 	path, err := configPath()
 	if err != nil {
-		return "", err
+		return composeConfig{}, err
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("Tracebox repo location not found (%s does not exist).\n"+
-				"Run tracebox.ps1 (Windows) or tracebox.sh (Linux/macOS) from the repo once to set this up.", path)
+			return composeConfig{}, fmt.Errorf("Tracebox setup not found (%s does not exist).\n"+
+				"Run tracebox.ps1 (Windows) or tracebox.sh (Linux/macOS) once to set this up.", path)
 		}
-		return "", fmt.Errorf("cannot read config file %s: %w", path, err)
+		return composeConfig{}, fmt.Errorf("cannot read config file %s: %w", path, err)
 	}
 	defer f.Close()
 
-	var repo string
+	var repo, compose string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -77,24 +102,47 @@ func readRepoPath() (string, error) {
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(key) == repoConfigKey {
+		switch strings.TrimSpace(key) {
+		case repoConfigKey:
 			repo = strings.TrimSpace(value)
+		case composeConfigKey:
+			compose = strings.TrimSpace(value)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("cannot read config file %s: %w", path, err)
-	}
-	if repo == "" {
-		return "", fmt.Errorf("config file %s does not record a %s.\n"+
-			"Re-run tracebox.ps1 / tracebox.sh from the repo to set this up.", path, repoConfigKey)
+		return composeConfig{}, fmt.Errorf("cannot read config file %s: %w", path, err)
 	}
 
-	compose := filepath.Join(repo, "docker-compose.yml")
-	if _, err := os.Stat(compose); err != nil {
-		return "", fmt.Errorf("recorded repo path %q has no docker-compose.yml (%v).\n"+
-			"Re-run tracebox.ps1 / tracebox.sh from the current repo to refresh the path.", repo, err)
+	// Standalone mode: an explicit compose_file pointing at the prebuilt-image
+	// compose the setup script wrote. Run it as-is — no local build.
+	if compose != "" {
+		if _, err := os.Stat(compose); err != nil {
+			return composeConfig{}, fmt.Errorf("recorded %s %q is missing (%v).\n"+
+				"Re-run tracebox.ps1 / tracebox.sh to refresh the standalone setup.", composeConfigKey, compose, err)
+		}
+		return composeConfig{
+			composeFile: compose,
+			projectDir:  filepath.Dir(compose),
+			build:       false,
+		}, nil
 	}
-	return repo, nil
+
+	// Repo mode: build the image locally from the cloned repo.
+	if repo != "" {
+		composeFile := filepath.Join(repo, "docker-compose.yml")
+		if _, err := os.Stat(composeFile); err != nil {
+			return composeConfig{}, fmt.Errorf("recorded repo path %q has no docker-compose.yml (%v).\n"+
+				"Re-run tracebox.ps1 / tracebox.sh from the current repo to refresh the path.", repo, err)
+		}
+		return composeConfig{
+			composeFile: composeFile,
+			projectDir:  repo,
+			build:       true,
+		}, nil
+	}
+
+	return composeConfig{}, fmt.Errorf("config file %s records neither %s nor %s.\n"+
+		"Re-run tracebox.ps1 / tracebox.sh to set this up.", path, composeConfigKey, repoConfigKey)
 }
 
 // checkDocker confirms the docker CLI is installed and the daemon is responding,
@@ -143,7 +191,7 @@ func startCommand(args []string) int {
 		}
 	}
 
-	repo, err := readRepoPath()
+	cfg, err := readComposeConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tracebox: %v\n", err)
 		return exitUsage
@@ -160,14 +208,21 @@ func startCommand(args []string) int {
 		runnerEnv = "gvisor"
 	}
 
-	compose := filepath.Join(repo, "docker-compose.yml")
+	compose := cfg.composeFile
 	fmt.Printf("Starting the Tracebox sandbox in %s mode...\n", mode)
-	fmt.Println("(First build compiles the sandbox image and can take a few minutes.)")
 
-	cmd := exec.Command("docker", "compose",
-		"-f", compose,
-		"--project-directory", repo,
-		"up", "-d", "--build")
+	// Repo mode builds the image from source; standalone mode runs the prebuilt
+	// published image (pulling it on first use). The compose args differ only by
+	// the --build flag.
+	upArgs := []string{"compose", "-f", compose, "--project-directory", cfg.projectDir, "up", "-d"}
+	if cfg.build {
+		upArgs = append(upArgs, "--build")
+		fmt.Println("(First build compiles the sandbox image and can take a few minutes.)")
+	} else {
+		fmt.Println("(First start pulls the sandbox image and can take a few minutes.)")
+	}
+
+	cmd := exec.Command("docker", upArgs...)
 	// Set GOBOXD_RUNNER explicitly so the chosen backend is deterministic
 	// regardless of any value inherited from the caller's environment. The compose
 	// file reads ${GOBOXD_RUNNER:-nsjail}, so this picks the backend directly.
@@ -215,7 +270,7 @@ func stopCommand(args []string) int {
 		return exitUsage
 	}
 
-	repo, err := readRepoPath()
+	cfg, err := readComposeConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tracebox: %v\n", err)
 		return exitUsage
@@ -225,11 +280,11 @@ func stopCommand(args []string) int {
 		return exitAPI
 	}
 
-	compose := filepath.Join(repo, "docker-compose.yml")
+	compose := cfg.composeFile
 	fmt.Println("Stopping the Tracebox sandbox (docker compose down)...")
 	cmd := exec.Command("docker", "compose",
 		"-f", compose,
-		"--project-directory", repo,
+		"--project-directory", cfg.projectDir,
 		"down")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

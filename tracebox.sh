@@ -1,23 +1,39 @@
 #!/usr/bin/env sh
 # tracebox.sh — one-command setup for Tracebox (Linux / macOS).
 #
-# Takes a fresh clone to a fully working setup:
-#   1. Checks Docker is installed and running.
-#   2. Checks Go is installed.
-#   3. Starts the sandbox API with docker compose and waits until it is healthy.
-#   4. Builds and installs the tracebox CLI onto your PATH.
-#   5. Builds the tracebox-mcp MCP server.
-#   6. Registers the MCP server with Claude Code (if the `claude` CLI is found).
-#   7. Records the repo location so `tracebox start`/`tracebox stop` work anywhere.
-#   8. Prints a summary of what was set up.
+# Works two ways, auto-detected:
 #
-# Safe to re-run: existing containers, an already-installed CLI and an
-# already-registered MCP server are detected and left alone / updated.
+#   REPO mode       — run from a git clone (docker-compose.yml + go.mod sit next
+#                     to this script). Builds the sandbox image and the CLI/MCP
+#                     binaries from source. Requires Docker and Go. This is the
+#                     contributor/developer path and is unchanged.
+#
+#   STANDALONE mode — run on its own with no repo and no Go (e.g. fetched via
+#                     `curl -fsSL .../tracebox.sh | sh`). Pulls the prebuilt
+#                     sandbox image from ghcr.io and downloads prebuilt CLI/MCP
+#                     binaries from the GitHub release. Requires only Docker.
+#
+# Either way it: starts the sandbox API and waits until healthy, installs the
+# CLI onto your PATH, sets up the MCP server, records where the compose project
+# lives so `tracebox start`/`tracebox stop` work anywhere, and prints a summary.
+#
+# Safe to re-run.
 
 set -eu
 
-# --- Locate the repo root (the directory containing this script). ----------
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# --- Distribution coordinates (STANDALONE mode). ---------------------------
+IMAGE="ghcr.io/nym01/tracebox:latest"
+RELEASE_BASE="https://github.com/nym01/Tracebox/releases/download/latest"
+TRACEBOX_DIR="$HOME/.tracebox"
+STANDALONE_COMPOSE="$TRACEBOX_DIR/docker-compose.yml"
+
+# --- Locate the directory containing this script (if any). -----------------
+# When piped (`curl ... | sh`) there is no script file; fall back to the CWD.
+if [ -n "${0:-}" ] && [ -f "$0" ]; then
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+else
+    SCRIPT_DIR=$(pwd)
+fi
 cd "$SCRIPT_DIR"
 
 API_URL="http://localhost:8080"
@@ -37,8 +53,45 @@ info() { printf '      %s\n' "$1"; }
 warn() { printf '%s  !!  %s%s\n' "$C_YELLOW" "$1" "$C_OFF"; }
 fail() { printf '\n%sERROR: %s%s\n' "$C_RED" "$1" "$C_OFF"; exit 1; }
 
-printf 'Tracebox setup\n'
-printf 'Repo: %s\n' "$SCRIPT_DIR"
+# download URL DEST — fetch URL to DEST using whichever client is available.
+download() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --retry 3 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        fail "Neither curl nor wget is available to download $1"
+    fi
+}
+
+# --- Detect REPO vs STANDALONE mode. ---------------------------------------
+# REPO mode needs both the compose file and the Go module next to the script;
+# anything else is a standalone install.
+if [ -f "$SCRIPT_DIR/docker-compose.yml" ] && [ -f "$SCRIPT_DIR/go.mod" ]; then
+    MODE=repo
+else
+    MODE=standalone
+fi
+
+printf 'Tracebox setup (%s mode)\n' "$MODE"
+[ "$MODE" = repo ] && printf 'Repo: %s\n' "$SCRIPT_DIR"
+
+# Resolve the OS/arch target name used by the release assets (standalone only).
+TARGET=""
+if [ "$MODE" = standalone ]; then
+    os=$(uname -s); arch=$(uname -m)
+    case "$os" in
+        Linux)  os=linux ;;
+        Darwin) os=darwin ;;
+        *) fail "Unsupported OS for standalone install: $os (use the git-clone path instead)." ;;
+    esac
+    case "$arch" in
+        x86_64|amd64)  arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) fail "Unsupported architecture for standalone install: $arch (use the git-clone path instead)." ;;
+    esac
+    TARGET="${os}-${arch}"
+fi
 
 # --- 1. Docker installed and running. --------------------------------------
 step 1 "Checking Docker..."
@@ -52,19 +105,53 @@ if ! docker info >/dev/null 2>&1; then
 fi
 ok "Docker is installed and running."
 
-# --- 2. Go installed. ------------------------------------------------------
+# --- 2. Go (REPO mode only). -----------------------------------------------
 step 2 "Checking Go..."
-if ! command -v go >/dev/null 2>&1; then
-    fail "Go not found - install from https://go.dev, then re-run this script.
-       (Pre-built binaries may be offered as an alternative in a future release.)"
+if [ "$MODE" = repo ]; then
+    if ! command -v go >/dev/null 2>&1; then
+        fail "Go not found - install from https://go.dev, then re-run this script.
+       (Or use the standalone install, which needs no Go: see the README.)"
+    fi
+    ok "Go is installed ($(go version))."
+else
+    ok "Standalone mode - skipping Go (prebuilt binaries will be downloaded)."
 fi
-ok "Go is installed ($(go version))."
 
 # --- 3. Start the sandbox API and wait for it to be healthy. ---------------
-step 3 "Starting the sandbox API (docker compose up -d --build)..."
-info "First build compiles nsjail and can take a few minutes - please wait."
-if ! docker compose up -d --build; then
-    fail "docker compose failed to start the sandbox API. See the output above."
+if [ "$MODE" = repo ]; then
+    step 3 "Starting the sandbox API (docker compose up -d --build)..."
+    info "First build compiles nsjail and can take a few minutes - please wait."
+    if ! docker compose up -d --build; then
+        fail "docker compose failed to start the sandbox API. See the output above."
+    fi
+else
+    step 3 "Starting the sandbox API (prebuilt image)..."
+    mkdir -p "$TRACEBOX_DIR"
+    # Minimal compose referencing the published image. Mirrors the repo
+    # docker-compose.yml but uses image: instead of build:. GOBOXD_RUNNER stays
+    # parameterised so `tracebox start --strict` selects the gVisor backend.
+    cat > "$STANDALONE_COMPOSE" <<EOF
+services:
+  goboxd:
+    image: $IMAGE
+    ports:
+      - "8080:8080"
+    environment:
+      GOBOXD_RUNNER: \${GOBOXD_RUNNER:-nsjail}
+      TRACEBOX_DB_PATH: /data/tracebox.db
+    volumes:
+      - tracebox-data:/data
+    privileged: true
+    cgroup: host
+
+volumes:
+  tracebox-data:
+EOF
+    ok "Wrote $STANDALONE_COMPOSE"
+    info "First start pulls the sandbox image and can take a few minutes - please wait."
+    if ! docker compose -f "$STANDALONE_COMPOSE" up -d; then
+        fail "docker compose failed to start the sandbox API. See the output above."
+    fi
 fi
 info "Containers are up. Waiting for the API to become healthy..."
 
@@ -112,12 +199,20 @@ else
     ok "Sandbox API is healthy at $API_URL"
 fi
 
-# --- 4. Build and install the CLI. -----------------------------------------
-step 4 "Building and installing the tracebox CLI..."
-go build -o "$CLI_BINARY" ./cmd/tracebox-cli
-info "Built ./$CLI_BINARY"
+# --- 4. Acquire and install the CLI. ---------------------------------------
+step 4 "Installing the tracebox CLI..."
+if [ "$MODE" = repo ]; then
+    go build -o "$CLI_BINARY" ./cmd/tracebox-cli
+    info "Built ./$CLI_BINARY"
+    SRC="$SCRIPT_DIR/$CLI_BINARY"
+else
+    DL_DIR=$(mktemp -d)
+    SRC="$DL_DIR/$CLI_BINARY"
+    info "Downloading prebuilt CLI ($TARGET)..."
+    download "$RELEASE_BASE/tracebox-cli-$TARGET" "$SRC"
+    chmod +x "$SRC"
+fi
 
-SRC="$SCRIPT_DIR/$CLI_BINARY"
 CLI_DEST=""
 PATH_HINT=0
 
@@ -137,8 +232,8 @@ elif mkdir -p "$HOME/.local/bin" 2>/dev/null && try_install "$HOME/.local/bin"; 
 else
     warn "Could not copy $CLI_BINARY to a directory on your PATH automatically."
     info "Finish with sudo:   sudo cp \"$SRC\" /usr/local/bin/$CLI_BINARY"
-    info "or add the repo to your PATH (in ~/.bashrc or ~/.zshrc):"
-    info "    export PATH=\"$SCRIPT_DIR:\$PATH\""
+    info "or add this folder to your PATH (in ~/.bashrc or ~/.zshrc):"
+    info "    export PATH=\"$(dirname "$SRC"):\$PATH\""
     CLI_DEST="$SRC"
 fi
 ok "Installed CLI: $CLI_DEST"
@@ -161,11 +256,20 @@ else
     warn "Could not invoke the installed tracebox binary directly."
 fi
 
-# --- 5. Build the MCP server. ----------------------------------------------
-step 5 "Building the tracebox-mcp server..."
-go build -o "$MCP_BINARY" ./cmd/tracebox-mcp
-MCP_PATH="$SCRIPT_DIR/$MCP_BINARY"
-ok "Built MCP server: $MCP_PATH"
+# --- 5. Acquire the MCP server. --------------------------------------------
+step 5 "Installing the tracebox-mcp server..."
+if [ "$MODE" = repo ]; then
+    go build -o "$MCP_BINARY" ./cmd/tracebox-mcp
+    MCP_PATH="$SCRIPT_DIR/$MCP_BINARY"
+else
+    # Install the prebuilt MCP server next to the CLI so it has a stable absolute
+    # path for `claude mcp add`.
+    MCP_PATH="$INSTALL_DIR/$MCP_BINARY"
+    info "Downloading prebuilt MCP server ($TARGET)..."
+    download "$RELEASE_BASE/tracebox-mcp-$TARGET" "$MCP_PATH"
+    chmod +x "$MCP_PATH"
+fi
+ok "MCP server: $MCP_PATH"
 
 # --- 6. Register the MCP server with Claude Code (if available). -----------
 step 6 "Registering the MCP server with Claude Code..."
@@ -198,28 +302,34 @@ else
     fi
 fi
 
-# --- 7. Record the repo location for `tracebox start`/`tracebox stop`. ------
+# --- 7. Record the compose location for `tracebox start`/`tracebox stop`. ---
 # The CLI binary lives on the PATH and can be invoked from anywhere, but it has
-# no built-in knowledge of where this repo (and its docker-compose.yml) lives.
-# Record the absolute repo path in a small config file so `tracebox start` and
-# `tracebox stop` can locate the compose project from any directory.
-step 7 "Recording the repo location for tracebox start/stop..."
+# no built-in knowledge of where the compose project lives. Record it so
+# `tracebox start` / `tracebox stop` can locate the project from any directory:
+#   repo_path     in repo mode      (build from the clone)
+#   compose_file  in standalone mode (run the prebuilt-image compose)
+step 7 "Recording the sandbox location for tracebox start/stop..."
 CONFIG_DIR="$HOME/.tracebox"
 CONFIG_FILE="$CONFIG_DIR/config"
 mkdir -p "$CONFIG_DIR"
-printf 'repo_path=%s\n' "$SCRIPT_DIR" > "$CONFIG_FILE"
-ok "Recorded repo path in $CONFIG_FILE"
+if [ "$MODE" = repo ]; then
+    printf 'repo_path=%s\n' "$SCRIPT_DIR" > "$CONFIG_FILE"
+    ok "Recorded repo path in $CONFIG_FILE"
+else
+    printf 'compose_file=%s\n' "$STANDALONE_COMPOSE" > "$CONFIG_FILE"
+    ok "Recorded compose file in $CONFIG_FILE"
+fi
 
 # --- 8. Summary. -----------------------------------------------------------
 printf '\n========================================\n'
-printf '%s Tracebox setup complete%s\n' "$C_GREEN" "$C_OFF"
+printf '%s Tracebox setup complete (%s mode)%s\n' "$C_GREEN" "$MODE" "$C_OFF"
 printf '========================================\n'
 printf '  Sandbox API : running at %s\n' "$API_URL"
 printf '  CLI         : installed at %s\n' "$CLI_DEST"
 case "$MCP_STATUS" in
     registered) printf '  MCP server  : registered with Claude Code (%s)\n' "$MCP_PATH" ;;
-    skipped)    printf '  MCP server  : built but NOT registered (Claude Code not found)\n' ;;
-    *)          printf '  MCP server  : built; automatic registration failed (see above)\n' ;;
+    skipped)    printf '  MCP server  : installed but NOT registered (Claude Code not found)\n' ;;
+    *)          printf '  MCP server  : installed; automatic registration failed (see above)\n' ;;
 esac
 printf '\nYou can now run scripts in the sandbox from any directory:\n'
 printf '    tracebox run script.py\n'

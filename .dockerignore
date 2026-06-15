@@ -1,0 +1,19 @@
+# Keep the Docker build context lean (matters most in CI, where the whole
+# context is uploaded to the builder). The image build only needs the Go module,
+# the source tree, internal/tracer's BPF C source, the external/nsjail submodule,
+# and configs/ — none of the frontend, e2e, or VCS data below.
+#
+# Do NOT add external/, configs/, go.mod, go.sum, or any *.go / *.c here: the
+# multi-stage build's `COPY . .` (Go build + go generate) and the final
+# `COPY configs/` depend on them.
+.git
+.github
+web
+.e2e
+dist
+docs
+*.exe
+goboxd
+tracebox
+tracebox-mcp
+**/node_modules

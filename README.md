@@ -4,20 +4,49 @@ goboxd is an HTTP sandbox runner that accepts source code, compiles or interpret
 
 ## Quick Start
 
-One command takes a fresh clone to a fully working setup: it starts the
-sandbox API, builds and installs the `tracebox` CLI onto your PATH, builds the
-MCP server, and (if Claude Code is installed) registers it.
+The same setup script (`tracebox.sh` / `tracebox.ps1`) works two ways and
+auto-detects which to use. Most people want the **standalone install** below;
+contributors who want to build from source use the **clone & build** path.
 
-**Prerequisites:**
-- [Docker](https://docs.docker.com/get-docker/) — runs the sandbox API
-  (Docker Desktop must be running)
-- [Go](https://go.dev/dl/) — builds the CLI and MCP server
-- _Optional:_ [Claude Code](https://docs.claude.com/en/docs/claude-code) — if
-  present, the script registers the Tracebox MCP server with it automatically
+In both cases the script starts the sandbox API, installs the `tracebox` CLI
+onto your PATH, sets up the MCP server, and (if Claude Code is installed)
+registers it. It is safe to re-run.
 
-**Run the setup script** from the repo root:
+The only hard prerequisite is [Docker](https://docs.docker.com/get-docker/)
+(Docker Desktop must be running). [Claude Code](https://docs.claude.com/en/docs/claude-code)
+is optional — if present, the Tracebox MCP server is registered with it
+automatically.
+
+### Standalone install (no clone, no Go)
+
+Downloads the prebuilt sandbox image from `ghcr.io/nym01/tracebox` and the
+prebuilt CLI/MCP binaries from the GitHub release — **Docker is the only
+requirement, no Go and no git clone needed.** One line:
 
 ```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/nym01/Tracebox/main/tracebox.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/nym01/Tracebox/main/tracebox.ps1 | iex
+```
+
+(Or download that one file and run it directly — `./tracebox.sh` /
+`.\tracebox.ps1`.) The first run pulls the sandbox image, which can take a few
+minutes.
+
+### Clone & build (contributors)
+
+Build everything from source. Needs [Docker](https://docs.docker.com/get-docker/),
+[Go](https://go.dev/dl/), and a git checkout (with the nsjail submodule). Run the
+script **from the repo root** — it detects the source tree and builds the image
+(including nsjail) and the CLI/MCP binaries locally:
+
+```sh
+git clone --recurse-submodules https://github.com/nym01/Tracebox.git
+cd Tracebox
 ./tracebox.sh       # Linux / macOS
 ```
 
@@ -25,17 +54,25 @@ MCP server, and (if Claude Code is installed) registers it.
 .\tracebox.ps1      # Windows (PowerShell)
 ```
 
-The script is safe to re-run — it skips work that is already done (containers
-already up, CLI already installed, MCP already registered). The first run can
-take a few minutes because it builds the sandbox image (including nsjail).
+The first run can take several minutes because it compiles nsjail from source.
 
-**Then run any script in the sandbox**, from any folder:
+### Then run any script in the sandbox
+
+From any folder, regardless of which install path you used:
 
 ```sh
 tracebox run script.py
 ```
 
 Restart your terminal first if the script reported that it changed your PATH.
+
+Manage the sandbox from anywhere — no need to re-run the setup script:
+
+```sh
+tracebox start            # start the sandbox (nsjail backend, default)
+tracebox start --strict   # start with the gVisor backend (stronger isolation)
+tracebox stop             # stop the sandbox
+```
 
 The code executes inside Tracebox's locked-down sandbox (no network, tight
 CPU/memory limits, throwaway filesystem) — never on your own machine. See

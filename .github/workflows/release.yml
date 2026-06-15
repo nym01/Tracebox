@@ -1,0 +1,148 @@
+# Build + publish the Tracebox distribution artifacts.
+#
+# This drives the no-clone / no-Go "standalone" install path (see the README's
+# "Quick install" section and tracebox.ps1 / tracebox.sh standalone mode):
+#
+#   1. image — build the single sandbox Docker image from Dockerfile and push it
+#      to ghcr.io/nym01/tracebox. ONE image serves BOTH backends: nsjail (default)
+#      and gVisor (`tracebox start --strict`) are both baked in, selected at
+#      `docker compose up` time via the GOBOXD_RUNNER env var. amd64 only for now.
+#
+#   2. cli — cross-compile the thin tracebox-cli HTTP client for the six
+#      OS/arch combos and publish them as assets on a single rolling release
+#      tagged `latest`, so the setup scripts can fetch a stable, predictable URL:
+#        https://github.com/nym01/Tracebox/releases/download/latest/tracebox-cli-<os>-<arch>[.exe]
+#
+# Triggers: every push to main, plus manual workflow_dispatch.
+#
+# ONE-TIME MANUAL STEP after the first successful image push: make the GHCR
+# package public so `docker pull` needs no auth —
+#   GitHub -> your profile -> Packages -> tracebox -> Package settings ->
+#   Change visibility -> Public.
+# Until then pulls require `docker login ghcr.io`.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialise runs on the same ref so two overlapping pushes can't race on the
+# single rolling 'latest' release (delete-then-create below is not concurrency
+# safe). Queue rather than cancel so an in-flight publish always finishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build & push sandbox image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (with nsjail submodule)
+        uses: actions/checkout@v4
+        with:
+          # The Dockerfile builds nsjail from the external/nsjail submodule
+          # (COPY external/nsjail ...), so it must be checked out.
+          submodules: recursive
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/nym01/tracebox
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build & push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  cli:
+    name: Cross-compile & release CLI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Cross-compile tracebox-cli and tracebox-mcp
+        run: |
+          set -eux
+          mkdir -p dist
+          # Both binaries are thin HTTP/stdio clients (no cgo), so CGO can stay
+          # off and every target cross-compiles from the linux runner. The MCP
+          # server ships alongside the CLI so standalone setups get MCP too.
+          for cmd in tracebox-cli tracebox-mcp; do
+            for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+              os=${target%/*}
+              arch=${target#*/}
+              ext=""
+              [ "$os" = "windows" ] && ext=".exe"
+              out="dist/${cmd}-${os}-${arch}${ext}"
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/${cmd}
+            done
+          done
+          ls -l dist
+
+      - name: Publish rolling 'latest' release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Guard: the cross-compile step must have produced assets (replaces
+          # softprops' fail_on_unmatched_files).
+          ls -1 dist/* >/dev/null
+          # Single release whose git tag is literally `latest`. The asset download
+          # URL is keyed by the TAG name (.../releases/download/latest/...), which
+          # is stable across rebuilds and works regardless of the prerelease flag —
+          # unlike the /releases/latest/ redirect, which skips prereleases.
+          #
+          # Delete-then-create is robust for BOTH the first ever run and re-runs,
+          # without depending on a third-party action's create/update semantics:
+          #   - delete removes the old release AND its tag (--cleanup-tag) so the
+          #     tag re-points at this commit (a truly rolling 'latest'). On the
+          #     first run there is nothing to delete, so `|| true` swallows the
+          #     "release not found" error.
+          #   - create remakes the release at this exact commit (--target) and
+          #     uploads fresh assets, overwriting cleanly with no duplicates. gh
+          #     auto-creates the `latest` tag here when it does not exist.
+          #   - --latest=false keeps this rolling prerelease from ever claiming the
+          #     repo's "Latest release" badge.
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Latest tracebox CLI (rolling)" \
+            --notes "Rolling build of the tracebox CLI and MCP server from the tip of main. Downloaded automatically by tracebox.ps1 / tracebox.sh in standalone mode (release tag: latest)." \
+            --prerelease \
+            --latest=false
