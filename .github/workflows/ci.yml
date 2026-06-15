@@ -1,0 +1,128 @@
+# Continuous integration: build verification + the automated test suites.
+#
+# This is intentionally SEPARATE from release.yml (which builds and publishes the
+# image and CLI binaries). The two run in parallel on push to main and do not
+# gate each other — publishing is a rolling 'latest' from the tip of main, and
+# gating every publish on a ~multi-minute image rebuild for the escape suite would
+# slow it down for little benefit. PRs are where these tests actually gate changes
+# before they reach main (via branch protection); release.yml never runs on PRs.
+#
+# Two jobs, run in parallel:
+#   1. test   — go vet + go test ./... (fast, no Docker).
+#   2. escape — build the sandbox image and run the 21-test escape suite against a
+#               live, privileged nsjail container, the specific "continuously
+#               checked" claim in the README. nsjail only: the suite probes Linux
+#               kernel primitives (namespaces/seccomp/cgroups), so ~6 of its tests
+#               are category errors under the gVisor backend (whose boundary is a
+#               userspace kernel) — see docs/gvisor-security-assessment.md, which
+#               classifies all 21 tests against the gVisor boundary instead.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch/PR to save minutes. release.yml has
+# its own (non-cancelling) queue and is unaffected by this group.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: go vet & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      # The eBPF tracer's bpf2go bindings (internal/tracer/trace_bpf*.go) are
+      # gitignored and generated at image-build time, so a clean checkout cannot
+      # compile internal/tracer on linux without them — and `go test ./...` /
+      # `go vet ./...` build every package, including that one. Install the same
+      # toolchain the Dockerfile builder stage uses and regenerate the bindings
+      # before vetting/testing. (No vmlinux.h / bpftool needed — the BPF program
+      # uses only stable tracepoint fields + helpers; see internal/tracer.)
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev
+
+      - name: Generate eBPF bindings
+        run: go generate ./internal/tracer/
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+  escape:
+    name: escape suite (nsjail backend)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with nsjail submodule)
+        uses: actions/checkout@v4
+        with:
+          # The Dockerfile builds nsjail from external/nsjail (COPY external/nsjail
+          # ...), so the submodule must be checked out.
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the same image release.yml ships, but load it into the local docker
+      # daemon (load: true) instead of pushing, so the next step can run it. A
+      # dedicated cache scope (ci-escape) keeps this build from racing release.yml's
+      # publish cache on a shared push-to-main run.
+      - name: Build sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: tracebox:ci
+          cache-from: type=gha,scope=ci-escape
+          cache-to: type=gha,mode=max,scope=ci-escape
+
+      # The escape suite is a black-box HTTP client against a real sandboxed
+      # container; it needs the same elevated access docker-compose grants nsjail
+      # (privileged for namespaces/seccomp/binds, cgroupns=host for the memory cap).
+      - name: Start sandboxed container (nsjail)
+        run: |
+          docker run -d --name tracebox-ci \
+            --privileged --cgroupns=host \
+            -p 8080:8080 -e GOBOXD_RUNNER=nsjail tracebox:ci
+
+      # Wait for /readyz (not just /healthz): /readyz returns 200 only once every
+      # language probe is ok, so the C/py3/java the escape tests submit are ready.
+      - name: Wait for sandbox to be ready
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+              echo "sandbox ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::sandbox did not become ready in time"
+          docker logs tracebox-ci || true
+          exit 1
+
+      - name: Run escape suite
+        run: go test -tags escapetests -v ./escapetests/...
+
+      - name: Container logs (always)
+        if: always()
+        run: docker logs tracebox-ci || true

@@ -1,5 +1,7 @@
 # Tracebox
 
+[![CI](https://github.com/nym01/Tracebox/actions/workflows/ci.yml/badge.svg)](https://github.com/nym01/Tracebox/actions/workflows/ci.yml)
+
 Tracebox runs untrusted code — including AI-generated code — in a locked-down
 sandbox, watches everything it does at the syscall level, and keeps a record
 you can replay. Built mainly so you can let an AI agent run code it wrote
@@ -59,11 +61,24 @@ Two separate sandboxing backends, switchable at any time:
   kernel reimplementation and never touches your real kernel at all.
   Stronger isolation, a bit slower (~200-250ms overhead).
 
-Both modes are continuously checked against a suite of 21 escape tests —
-real attempts to break out of the sandbox, all of which currently fail (as
-they should). See [`docs/security.md`](docs/security.md) for the full
-security model and [`docs/escape-tests.md`](docs/escape-tests.md) for the
-test results.
+The default **nsjail** backend is continuously checked in CI against a suite
+of 21 escape tests — real attempts to break out of the sandbox, all of which
+currently fail (as they should). On every push and pull request, CI runs
+`go vet`, `go test ./...`, and the full escape suite against a freshly built,
+live sandboxed container.
+
+That suite probes Linux-kernel primitives (namespaces, seccomp, cgroups), so
+it is specific to the nsjail backend. The **gVisor** (`--strict`) backend's
+boundary is a userspace kernel rather than those primitives, so several of the
+21 tests are category errors against it (e.g. a syscall nsjail's seccomp filter
+kills is simply handled by gVisor's sentry); it is instead assessed separately
+in [`docs/gvisor-security-assessment.md`](docs/gvisor-security-assessment.md),
+which classifies all 21 tests against the gVisor boundary and verifies the
+equivalent properties on a live gVisor instance. To run the escape suite
+yourself against either backend, see the header of `escapetests/client.go`.
+
+See [`docs/security.md`](docs/security.md) for the full security model and
+[`docs/escape-tests.md`](docs/escape-tests.md) for the test results.
 
 ## Building from source (contributors)
 
