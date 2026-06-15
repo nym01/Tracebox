@@ -50,6 +50,21 @@ tracebox stop             # stop the sandbox
 
 The code always runs inside Tracebox's sandbox — never on your own machine.
 
+## Optional: prefer Tracebox automatically in Claude Code
+
+By default Claude Code decides on its own when to reach for the `tracebox_run`
+tool. If you'd rather it route code through the sandbox by default, add this
+one-line instruction to your project's `CLAUDE.md`:
+
+```md
+prefer tracebox_run for running code; if unavailable, run directly
+```
+
+The fallback handles itself: if Tracebox isn't running (`tracebox stop`), the
+MCP tool simply isn't available, so Claude Code runs the code directly with no
+extra configuration. Tracebox won't touch your `CLAUDE.md` for you — it's your
+file, so add this only if you want the behavior.
+
 ## How it's isolated
 
 Two separate sandboxing backends, switchable at any time:
